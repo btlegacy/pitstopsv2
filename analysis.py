@@ -7,21 +7,18 @@ from detectron2 import model_zoo
 from detectron2.data import MetadataCatalog
 
 # --- Model Loading ---
-# This function is cached by Streamlit to avoid reloading the model on each run
+@st.cache_resource
 def get_predictor():
     """
     Initializes and returns the Detectron2 predictor.
     """
     cfg = get_cfg()
-    # Use a pre-trained model from Detectron2's model zoo
+    # This config file is compatible with the older detectron2 version
     config_file = "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"
     cfg.merge_from_file(model_zoo.get_config_file(config_file))
     cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(config_file)
     
-    # Set the threshold for detection confidence
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7
-    
-    # Use CPU for deployment on Streamlit Cloud
     cfg.MODEL.DEVICE = "cpu"
     
     predictor = DefaultPredictor(cfg)
@@ -34,7 +31,6 @@ def get_car_centroid(predictor, metadata, frame, prev_centroid):
     """
     outputs = predictor(frame)
     
-    # Look for the 'car' class in the predictions
     instances = outputs["instances"]
     car_class_index = metadata.thing_classes.index("car")
     
@@ -42,15 +38,12 @@ def get_car_centroid(predictor, metadata, frame, prev_centroid):
     car_scores = instances[instances.pred_classes == car_class_index].scores.numpy()
 
     if len(car_boxes) == 0:
-        return prev_centroid # Return previous centroid if no car is detected
+        return prev_centroid
 
-    # Assume the car with the highest score is our target
     best_car_index = np.argmax(car_scores)
     box = car_boxes[best_car_index]
     
     x1, y1, x2, y2 = box
-    
-    # Calculate the centroid of the bounding box
     cX = int((x1 + x2) / 2)
     cY = int((y1 + y2) / 2)
 
@@ -61,6 +54,8 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
     """
     Calculates the total pit stop time from a video using Detectron2.
     """
+    # Note: I'm adding a decorator to the get_predictor function to cache it with Streamlit
+    # This is a performance improvement. Let's make sure your app.py calls it.
     predictor, metadata = get_predictor()
     
     cap = cv2.VideoCapture(video_path)
@@ -80,7 +75,6 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
     
     frame_number = 0
     
-    # Initialize centroid to the center of the frame
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     current_centroid = (width // 2, height // 2)
@@ -92,18 +86,15 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
 
         frame_number += 1
         
-        # Skip initial frames to avoid noise
         if frame_number < total_frames * 0.1:
             continue
         
-        # Get car position using Detectron2
         current_centroid = get_car_centroid(predictor, metadata, frame, current_centroid)
         
         if prev_centroid_x is not None:
             delta_x = abs(current_centroid[0] - prev_centroid_x)
 
             if not pit_stop_started:
-                # Check for car stopping
                 if delta_x < stop_threshold:
                     stopped_frames_count += 1
                 else:
@@ -114,7 +105,7 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
                     start_frame = frame_number - buffer_frames
                     stopped_frames_count = 0
 
-            else: # Pit stop has started, check for movement
+            else:
                 if delta_x > move_threshold:
                     moving_frames_count += 1
                 else:
@@ -129,4 +120,4 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
         prev_centroid_x = current_centroid[0]
 
     cap.release()
-    raise ValueError("Pit stop start or end could not be determined. The car may not have been detected reliably.")
+    raise ValueError("Pit stop start or end could not be determined.")
