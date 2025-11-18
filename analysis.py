@@ -1,57 +1,68 @@
 import cv2
 import numpy as np
+import torch
+from detectron2.config import get_cfg
+from detectron2.engine import DefaultPredictor
+from detectron2 import model_zoo
+from detectron2.data import MetadataCatalog
 
-def get_car_centroid(frame, prev_centroid):
+# --- Model Loading ---
+# This function is cached by Streamlit to avoid reloading the model on each run
+def get_predictor():
     """
-    Detect the car in the frame and return its centroid.
-    This is a simplified detection method assuming the car is the largest moving object.
+    Initializes and returns the Detectron2 predictor.
     """
-    # Convert to grayscale and apply blur
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (21, 21), 0)
-
-    # A simple threshold to find large bright objects (like the car)
-    _, thresh = cv2.threshold(blurred, 150, 255, cv2.THRESH_BINARY)
+    cfg = get_cfg()
+    # Use a pre-trained model from Detectron2's model zoo
+    config_file = "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"
+    cfg.merge_from_file(model_zoo.get_config_file(config_file))
+    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(config_file)
     
-    # Dilate to fill in holes
-    dilated = cv2.dilate(thresh, None, iterations=2)
-
-    # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return prev_centroid # Return previous if no contour found
-
-    # Find the largest contour, which we assume is the car
-    largest_contour = max(contours, key=cv2.contourArea)
+    # Set the threshold for detection confidence
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7
     
-    # Check if the contour is reasonably large
-    if cv2.contourArea(largest_contour) < 5000: # Threshold for car size
-        return prev_centroid
+    # Use CPU for deployment on Streamlit Cloud
+    cfg.MODEL.DEVICE = "cpu"
+    
+    predictor = DefaultPredictor(cfg)
+    return predictor, MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
 
-    M = cv2.moments(largest_contour)
-    if M["m00"] == 0:
-        return prev_centroid
-        
-    cX = int(M["m10"] / M["m00"])
-    cY = int(M["m01"] / M["m00"])
+# --- Car Detection ---
+def get_car_centroid(predictor, metadata, frame, prev_centroid):
+    """
+    Detects the car in the frame using Detectron2 and returns its centroid.
+    """
+    outputs = predictor(frame)
+    
+    # Look for the 'car' class in the predictions
+    instances = outputs["instances"]
+    car_class_index = metadata.thing_classes.index("car")
+    
+    car_boxes = instances[instances.pred_classes == car_class_index].pred_boxes.tensor.numpy()
+    car_scores = instances[instances.pred_classes == car_class_index].scores.numpy()
+
+    if len(car_boxes) == 0:
+        return prev_centroid # Return previous centroid if no car is detected
+
+    # Assume the car with the highest score is our target
+    best_car_index = np.argmax(car_scores)
+    box = car_boxes[best_car_index]
+    
+    x1, y1, x2, y2 = box
+    
+    # Calculate the centroid of the bounding box
+    cX = int((x1 + x2) / 2)
+    cY = int((y1 + y2) / 2)
 
     return (cX, cY)
 
-def calculate_pit_stop_time(video_path, stop_threshold=2, move_threshold=5, buffer_frames=5):
+# --- Pit Stop Calculation (Main Logic) ---
+def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buffer_frames=5):
     """
-    Calculates the total pit stop time from a video.
-
-    Args:
-        video_path (str): The path to the video file.
-        stop_threshold (int): The maximum pixel change in x-axis to be considered 'stopped'.
-        move_threshold (int): The minimum pixel change in x-axis to be considered 'moving'.
-        buffer_frames (int): Number of consecutive frames needed to confirm a state change.
-
-    Returns:
-        A tuple containing (total_time, start_frame, end_frame, fps).
-        Raises an exception if a pit stop cannot be determined.
+    Calculates the total pit stop time from a video using Detectron2.
     """
+    predictor, metadata = get_predictor()
+    
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError("Cannot open video file")
@@ -60,7 +71,6 @@ def calculate_pit_stop_time(video_path, stop_threshold=2, move_threshold=5, buff
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     prev_centroid_x = None
-    
     stopped_frames_count = 0
     moving_frames_count = 0
     
@@ -82,33 +92,33 @@ def calculate_pit_stop_time(video_path, stop_threshold=2, move_threshold=5, buff
 
         frame_number += 1
         
-        # We only start processing in the middle part of the video to avoid initial/final noise
+        # Skip initial frames to avoid noise
         if frame_number < total_frames * 0.1:
             continue
-
-        current_centroid = get_car_centroid(frame, current_centroid)
+        
+        # Get car position using Detectron2
+        current_centroid = get_car_centroid(predictor, metadata, frame, current_centroid)
         
         if prev_centroid_x is not None:
             delta_x = abs(current_centroid[0] - prev_centroid_x)
 
-            # --- State Machine ---
             if not pit_stop_started:
                 # Check for car stopping
                 if delta_x < stop_threshold:
                     stopped_frames_count += 1
                 else:
-                    stopped_frames_count = 0 # Reset if it moves
+                    stopped_frames_count = 0 
 
                 if stopped_frames_count >= buffer_frames:
                     pit_stop_started = True
                     start_frame = frame_number - buffer_frames
-                    stopped_frames_count = 0 # Reset counter
+                    stopped_frames_count = 0
 
-            else: # Pit stop has started, now check for car moving again
+            else: # Pit stop has started, check for movement
                 if delta_x > move_threshold:
                     moving_frames_count += 1
                 else:
-                    moving_frames_count = 0 # Reset if it stops moving
+                    moving_frames_count = 0
 
                 if moving_frames_count >= buffer_frames:
                     end_frame = frame_number - buffer_frames
@@ -119,4 +129,4 @@ def calculate_pit_stop_time(video_path, stop_threshold=2, move_threshold=5, buff
         prev_centroid_x = current_centroid[0]
 
     cap.release()
-    raise ValueError("Pit stop start or end could not be determined in the video.")
+    raise ValueError("Pit stop start or end could not be determined. The car may not have been detected reliably.")
