@@ -14,16 +14,39 @@ st.set_page_config(page_title="Pit Stop Analytics AI", layout="wide")
 # --- Load AI Model ---
 @st.cache_resource
 def load_model():
-    # Standard YOLO model
     return YOLO('yolov8n.pt')
 
+# --- Helper: Feature Matching (Reference Image) ---
+def get_ref_features(ref_image):
+    """Compute ORB keypoints and descriptors for the reference image."""
+    if ref_image is None: return None, None
+    orb = cv2.ORB_create(nfeatures=1000)
+    kp, des = orb.detectAndCompute(ref_image, None)
+    return kp, des
+
+def match_features(frame_gray, ref_des, orb_detector):
+    """Check if reference features exist in the current frame."""
+    if ref_des is None: return False, []
+    
+    kp_frame, des_frame = orb_detector.detectAndCompute(frame_gray, None)
+    if des_frame is None: return False, []
+    
+    # Matcher
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(ref_des, des_frame)
+    
+    # Sort matches by distance
+    matches = sorted(matches, key=lambda x: x.distance)
+    
+    # Keep top matches
+    good_matches = matches[:50]
+    
+    # Extract points
+    src_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    return len(good_matches) > 15, src_pts # Threshold of 15 matches
+
 # --- Analysis Engine ---
-def process_video_with_ai(video_path, progress_callback):
-    """
-    Runs YOLOv8 tracking with 'Object Permanence'.
-    If the car is detected and then occluded by crew, we assume it is still there 
-    and stationary until we see it move again or large motion indicates departure.
-    """
+def process_video_with_ai(video_path, ref_img_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
     
@@ -33,24 +56,25 @@ def process_video_with_ai(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Setup output video
+    # Load Reference Image if provided
+    ref_des = None
+    orb = None
+    if ref_img_path:
+        ref_img = cv2.imread(ref_img_path, cv2.IMREAD_GRAYSCALE)
+        orb = cv2.ORB_create(nfeatures=1000)
+        _, ref_des = get_ref_features(ref_img)
+
+    # Setup output
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
     out = cv2.VideoWriter(temp_output.name, fourcc, fps, (width, height))
 
     telemetry_data = []
-    
-    # State Variables
     prev_gray = None
     
-    # Memory for Car Tracking (The "Object Permanence" Fix)
-    last_car_center = None 
-    frames_since_last_seen = 0
-    MAX_MEMORY_FRAMES = fps * 20  # Remember car position for up to 20 seconds of occlusion
-    
-    # Define Pit Stall Zone (Center 50%)
-    stall_x_start = int(width * 0.25)
-    stall_x_end = int(width * 0.75)
+    # Zones
+    stall_x_start = int(width * 0.20) # Widen slightly (20% to 80%) to catch entry
+    stall_x_end = int(width * 0.80)
     
     frame_idx = 0
     
@@ -58,123 +82,69 @@ def process_video_with_ai(video_path, progress_callback):
         ret, frame = cap.read()
         if not ret:
             break
-        
-        # 1. AI Inference
-        # Lower confidence slightly to catch car under crew
-        results = model.track(frame, persist=True, classes=[0, 2], verbose=False, conf=0.25)
-        
-        # 2. Extract Data
-        current_car_center = None
-        crew_count = 0
-        
-        if results[0].boxes.id is not None:
-            boxes = results[0].boxes.xywh.cpu().numpy()
-            class_ids = results[0].boxes.cls.cpu().numpy()
             
-            for box, cls in zip(boxes, class_ids):
-                x, y, w, h = box
-                if int(cls) == 0: # Person
-                    crew_count += 1
-                elif int(cls) == 2: # Car
-                    # If multiple cars, take the one closest to the center or previous pos
-                    current_car_center = (x, y)
-
-        # 3. Logic: Handle Occlusion (Memory)
-        is_occluded = False
-        
-        if current_car_center is not None:
-            # Car is visible
-            last_car_center = current_car_center
-            frames_since_last_seen = 0
-            velocity_calc_pos = current_car_center
-        else:
-            # Car is NOT visible (blocked by crew?)
-            if last_car_center is not None and frames_since_last_seen < MAX_MEMORY_FRAMES:
-                # Use memory
-                velocity_calc_pos = last_car_center
-                frames_since_last_seen += 1
-                is_occluded = True
-            else:
-                # Car is truly gone
-                velocity_calc_pos = None
-
-        # 4. Calculate Velocity
-        # If occluded, we assume velocity is 0 (Stationary)
-        velocity = 0.0
-        in_stall = False
-        
-        if velocity_calc_pos is not None:
-            # Check Stall Zone
-            if stall_x_start < velocity_calc_pos[0] < stall_x_end:
-                in_stall = True
-
-            if not is_occluded and frames_since_last_seen == 0:
-                # Only calculate active velocity if we actually see the car moving
-                # If we are using memory, velocity is effectively 0
-                if frame_idx > 0 and last_car_center is not None:
-                    # This is a simplification; usually requires previous frame's exact pos
-                    # But for "Stop detection", 0 velocity during occlusion is what we want.
-                    pass
-            
-            # For the purpose of the algorithm:
-            # If Occluded inside box -> Velocity = 0.0
-            # If Visible -> Calculate delta (we need a separate tracker for 'prev_frame_pos' to be precise, 
-            # but simple approach: if is_occluded, vel=0. If not, let's assume detected movement)
-            
-        # Refined Velocity Calculation
-        # We need a persistent variable for the *previous frame's* effective position
-        # to calculate speed when visible.
-        # (Simulated below for robustness)
-        if is_occluded:
-            velocity = 0.0
-        elif current_car_center is not None and 'prev_real_pos' in locals() and prev_real_pos is not None:
-             dx = current_car_center[0] - prev_real_pos[0]
-             dy = current_car_center[1] - prev_real_pos[1]
-             velocity = np.sqrt(dx**2 + dy**2)
-        
-        if current_car_center is not None:
-            prev_real_pos = current_car_center
-        else:
-            prev_real_pos = None # Reset if lost, avoids jump spikes
-
-        # 5. Pixel Motion (Global Activity)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+        gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+        
+        # 1. Motion Score
         motion_score = 0.0
         if prev_gray is not None:
-            delta = cv2.absdiff(prev_gray, gray)
+            delta = cv2.absdiff(prev_gray, gray_blur)
             thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)[1]
             motion_score = np.sum(thresh) / 255.0
-        prev_gray = gray
+        prev_gray = gray_blur
 
-        # 6. Drawing & Overlay
+        # 2. AI Detection (YOLO)
+        results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15) # Lower conf to catch fisheye car
+        
+        car_detected = False
+        car_center_x = -1
+        
+        if results[0].boxes.id is not None:
+            # Get largest car box
+            boxes = results[0].boxes.xywh.cpu().numpy()
+            # Find box with largest area (closest/main car)
+            areas = boxes[:, 2] * boxes[:, 3]
+            largest_idx = np.argmax(areas)
+            bx, by, bw, bh = boxes[largest_idx]
+            
+            car_center_x = bx
+            car_detected = True
+
+        # 3. Reference Match Fallback
+        ref_match_detected = False
+        if not car_detected and ref_des is not None:
+            match_found, points = match_features(gray, ref_des, orb)
+            if match_found:
+                ref_match_detected = True
+                # Calculate centroid of matched points
+                car_center_x = np.mean(points[:, 0, 0])
+        
+        # 4. In Stall Logic
+        in_stall = False
+        if car_detected or ref_match_detected:
+            if stall_x_start < car_center_x < stall_x_end:
+                in_stall = True
+
+        # Draw Overlay
         annotated_frame = results[0].plot()
         
         # Draw Stall Zone
-        color_zone = (0, 255, 0) if in_stall else (255, 255, 0) # Green if in, Cyan if out
-        cv2.line(annotated_frame, (stall_x_start, 0), (stall_x_start, height), color_zone, 2)
-        cv2.line(annotated_frame, (stall_x_end, 0), (stall_x_end, height), color_zone, 2)
-        cv2.putText(annotated_frame, "PIT STALL ZONE", (stall_x_start + 10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_zone, 2)
-
-        # Draw Car Center (Ghost or Real)
-        if velocity_calc_pos is not None:
-            cx, cy = int(velocity_calc_pos[0]), int(velocity_calc_pos[1])
-            # Draw crosshair
-            if is_occluded:
-                cv2.putText(annotated_frame, "CAR OCCLUDED (LOCKED)", (cx - 50, cy - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-                cv2.circle(annotated_frame, (cx, cy), 10, (0, 0, 255), -1) # Red dot = Memory
-            else:
-                cv2.circle(annotated_frame, (cx, cy), 10, (0, 255, 0), -1) # Green dot = Active
-
+        color = (0,255,0) if in_stall else (255,255,0)
+        cv2.line(annotated_frame, (stall_x_start, 0), (stall_x_start, height), color, 2)
+        cv2.line(annotated_frame, (stall_x_end, 0), (stall_x_end, height), color, 2)
+        
+        status_txt = "CAR FOUND" if (car_detected or ref_match_detected) else "SEARCHING..."
+        cv2.putText(annotated_frame, status_txt, (stall_x_start, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        
         out.write(annotated_frame)
 
         telemetry_data.append({
             "Frame": frame_idx,
             "Time": frame_idx / fps,
-            "Velocity": velocity,
+            "Motion_Intensity": motion_score,
             "In_Stall": in_stall,
-            "Is_Occluded": is_occluded,
-            "Motion_Intensity": motion_score
+            "Car_Center_X": car_center_x
         })
 
         frame_idx += 1
@@ -186,176 +156,207 @@ def process_video_with_ai(video_path, progress_callback):
     
     return pd.DataFrame(telemetry_data), temp_output.name, fps
 
-def analyze_timings(df, fps):
-    # 1. Smooth Velocity
-    # We use a fillna(0) just in case
-    df['Velocity'] = df['Velocity'].fillna(0)
-    df['Velocity_Smooth'] = savgol_filter(df['Velocity'], 15, 3)
+def analyze_timings_valley(df, fps):
+    """
+    Robust Valley Detection:
+    1. Identify the "Arrival Peak" (High motion).
+    2. Identify the "Departure Peak" (High motion).
+    3. The pit stop is the 'Quiet Zone' in between.
+    """
+    # Smooth motion
+    df['Motion_Smooth'] = savgol_filter(df['Motion_Intensity'], 15, 3)
+    
+    # Heuristic: A "Spike" is motion > 20% of max motion
+    max_motion = df['Motion_Smooth'].max()
+    threshold_high = max_motion * 0.25  # Threshold for Arrival/Departure
+    threshold_low = max_motion * 0.10   # Threshold for "Stopped"
+    
+    # Find peaks (Arrival and Departure)
+    # We look for peaks with a minimum distance between them (e.g., 5 seconds * fps)
+    peaks, properties = find_peaks(df['Motion_Smooth'], height=threshold_high, distance=fps*5)
+    
+    t_start, t_end = None, None
+    
+    if len(peaks) >= 2:
+        # Assume First Peak is Arrival, Last Peak is Departure
+        arrival_peak_idx = peaks[0]
+        departure_peak_idx = peaks[-1]
+        
+        # REFINEMENT: Find exact Start (when motion DROPS after arrival)
+        # Scan forward from arrival peak until motion < threshold_low
+        start_idx = arrival_peak_idx
+        for i in range(arrival_peak_idx, len(df)):
+            if df['Motion_Smooth'].iloc[i] < threshold_low:
+                start_idx = i
+                break
+                
+        # REFINEMENT: Find exact End (when motion RISES before departure)
+        # Scan backward from departure peak
+        end_idx = departure_peak_idx
+        for i in range(departure_peak_idx, start_idx, -1):
+            if df['Motion_Smooth'].iloc[i] < threshold_low:
+                end_idx = i
+                break
+        
+        t_start = df.iloc[start_idx]['Time']
+        t_end = df.iloc[end_idx]['Time']
+    else:
+        # Fallback if peaks aren't distinct: Use simple thresholding logic
+        # Find longest contiguous block of "Low Motion" in the middle 80% of video
+        mid_df = df.iloc[int(len(df)*0.1):int(len(df)*0.9)]
+        low_motion_mask = mid_df['Motion_Smooth'] < threshold_low
+        
+        # Identify blocks
+        mid_df = mid_df.copy() # avoid setting on copy warning
+        mid_df['block'] = (low_motion_mask != low_motion_mask.shift()).cumsum()
+        blocks = mid_df[low_motion_mask].groupby('block')
+        
+        if len(blocks) > 0:
+            largest_block = blocks.size().idxmax()
+            segment = mid_df[mid_df['block'] == largest_block]
+            t_start = segment['Time'].min()
+            t_end = segment['Time'].max()
 
-    # 2. Determine Stop State
-    # Rule: Velocity is Low AND (Car is In Stall OR Car is Occluded in Stall)
-    # Note: If Is_Occluded is True, Velocity is 0.0 by definition above.
-    
-    # Thresholds
-    stop_velocity_thresh = 5.0 # Higher threshold because "Active" velocity is noisy
-    
-    df['Valid_Stop'] = (df['Velocity_Smooth'] < stop_velocity_thresh) & (df['In_Stall'] == True)
+    # Tire Change Detection (Jacks)
+    # Look for spikes inside the determined window
+    t_up, t_down = t_start, t_end
+    if t_start and t_end:
+        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
+        if not stop_window.empty:
+            motion_curve = stop_window['Motion_Intensity'].values
+            # Find internal peaks (crew activity)
+            # Use a lower prominence to catch jacks
+            jacks_peaks, _ = find_peaks(motion_curve, prominence=np.max(motion_curve)*0.15)
+            
+            if len(jacks_peaks) > 0:
+                times = stop_window.iloc[jacks_peaks]['Time'].values
+                t_up = times[0]
+                t_down = times[-1]
 
-    # 3. Clean up the Stop Signal (Remove tiny gaps)
-    # If the stop signal flickers for < 0.5 seconds, ignore the flicker
-    # We use a rolling window or simple gap filling
-    # (Simpler: Find largest continuous block)
-    
-    df['block'] = (df['Valid_Stop'] != df['Valid_Stop'].shift()).cumsum()
-    blocks = df[df['Valid_Stop']].groupby('block')
-    
-    if len(blocks) == 0:
-        return None, None, None
-
-    # Get the largest block (The actual pit stop)
-    largest_block = blocks.size().idxmax()
-    stop_segment = df[df['block'] == largest_block]
-    
-    start_frame = stop_segment['Frame'].min()
-    end_frame = stop_segment['Frame'].max()
-    
-    # --- 4. Refine Start/End using Motion Intensity ---
-    # Velocity can be laggy. Motion Intensity is instant.
-    # The "Stop" is the valley between two motion peaks.
-    
-    # Look at motion data +/- 2 seconds around the detected start/end
-    # to snap to the exact moment movement stops/starts.
-    
-    # (Optional refinement, for now, the Velocity+Memory logic is robust enough for ~0.5s accuracy)
-    
-    t_start = start_frame / fps
-    t_end = end_frame / fps
-    
-    # 5. Detect Jacks (Peaks inside the stop window)
-    stop_window_df = df[(df['Frame'] >= start_frame) & (df['Frame'] <= end_frame)]
-    motion_curve = stop_window_df['Motion_Intensity'].values
-    
-    t_jacks_up = t_start
-    t_jacks_down = t_end
-    
-    if len(motion_curve) > 0:
-        peaks, _ = find_peaks(motion_curve, prominence=np.max(motion_curve)*0.15, distance=fps/2)
-        if len(peaks) > 0:
-            peak_times = stop_window_df.iloc[peaks]['Time'].values
-            t_jacks_up = peak_times[0]
-            t_jacks_down = peak_times[-1]
-
-    return t_start, t_end, (t_jacks_up, t_jacks_down)
+    return t_start, t_end, (t_up, t_down)
 
 # --- Main UI ---
 def main():
-    st.title("🏁 Pit Stop AI Analyzer")
-    st.markdown("### Automated Analysis with Stall Detection")
-    st.info("Timer starts when car stops in the **Center Zone**. Logic includes **Occlusion Memory** to handle crew covering the car.")
+    st.title("🏁 Pit Stop AI Analyzer V4")
+    st.markdown("### Hybrid Motion & Reference Matching")
+    st.info("Uses Global Motion to find the 'Quiet Valley' (Stop) between Arrival/Departure spikes. Can use Reference Image to aid detection.")
+
+    # Sidebar for Reference Image
+    st.sidebar.header("Configuration")
+    ref_file = st.sidebar.file_uploader("Upload Car Reference Image (Optional)", type=['jpg', 'png'])
+    
+    # Try to find default ref if not uploaded
+    default_ref_path = os.path.join("files", "refs", "car.jpg") # Adjust based on your repo structure if known
+    ref_path = None
+
+    if ref_file:
+        # Save uploaded ref
+        tref = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        tref.write(ref_file.read())
+        tref.close()
+        ref_path = tref.name
+        st.sidebar.success("Reference Image Loaded")
+    elif os.path.exists(default_ref_path):
+        ref_path = default_ref_path
+        st.sidebar.info(f"Using repository reference: {default_ref_path}")
 
     # Session State
     if 'analysis_done' not in st.session_state:
-        st.session_state['analysis_done'] = False
-        st.session_state['df'] = None
-        st.session_state['video_path'] = None
-        st.session_state['timings'] = None
+        st.session_state.update({
+            'analysis_done': False, 
+            'df': None, 
+            'video_path': None, 
+            'timings': None
+        })
 
     uploaded_file = st.file_uploader("Upload Overhead Video", type=["mp4", "mov", "avi"])
 
-    if uploaded_file is not None:
-        if st.button("Start AI Analysis", type="primary"):
-            st.session_state['analysis_done'] = False
-            
-            tfile_in = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') 
-            tfile_in.write(uploaded_file.read())
-            tfile_in.flush()
+    if uploaded_file and st.button("Start Analysis", type="primary"):
+        st.session_state['analysis_done'] = False
+        
+        tfile_in = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') 
+        tfile_in.write(uploaded_file.read())
+        tfile_in.flush()
 
-            try:
-                progress_bar = st.progress(0)
-                status = st.empty()
-                status.write("Initializing AI... Tracking Car & Crew...")
-                
-                df, vid_path, fps = process_video_with_ai(tfile_in.name, progress_bar.progress)
-                
-                status.write("Calculating Valid Stop Times...")
-                t_start, t_end, (t_up, t_down) = analyze_timings(df, fps)
-                
-                if t_start is None:
-                    st.error("No valid pit stop detected. (Car did not stop in the center zone).")
-                else:
-                    st.session_state['df'] = df
-                    st.session_state['video_path'] = vid_path
-                    st.session_state['timings'] = (t_start, t_end, t_up, t_down)
-                    st.session_state['analysis_done'] = True
-                
-                progress_bar.empty()
-                status.empty()
-                
-            except Exception as e:
-                st.error(f"Analysis Error: {e}")
-            finally:
-                try:
-                    os.remove(tfile_in.name)
-                except:
-                    pass
+        try:
+            progress_bar = st.progress(0)
+            status = st.empty()
+            status.write("Analyzing Motion Profile & Detecting Object...")
+            
+            df, vid_path, fps = process_video_with_ai(tfile_in.name, ref_path, progress_bar.progress)
+            
+            status.write("Identifying Pit Stop Window...")
+            t_start, t_end, (t_up, t_down) = analyze_timings_valley(df, fps)
+            
+            if t_start is None:
+                st.error("Could not identify a clear pit stop window (Arrival -> Stop -> Departure).")
+            else:
+                st.session_state.update({
+                    'df': df,
+                    'video_path': vid_path,
+                    'timings': (t_start, t_end, t_up, t_down),
+                    'analysis_done': True
+                })
+            
+            progress_bar.empty()
+            status.empty()
+            
+        except Exception as e:
+            st.error(f"Error: {e}")
+        finally:
+            if os.path.exists(tfile_in.name): os.remove(tfile_in.name)
+            if ref_path and ref_file: os.remove(ref_path) # clean up uploaded ref
 
     if st.session_state['analysis_done']:
         df = st.session_state['df']
         vid_path = st.session_state['video_path']
         t_start, t_end, t_up, t_down = st.session_state['timings']
 
-        # Results
         st.divider()
         m1, m2, m3, m4 = st.columns(4)
-        
         m1.metric("Pit Stop Duration", f"{(t_end - t_start):.2f}s")
         m2.metric("Tire Change", f"{(t_down - t_up):.2f}s")
         m3.metric("Stop Time", f"{t_start:.2f}s")
         m4.metric("Go Time", f"{t_end:.2f}s")
 
+        st.subheader("📊 Motion Telemetry")
+        
         # Chart
-        st.subheader("📊 Telemetry")
         base = alt.Chart(df).encode(x='Time')
         
-        line_velocity = base.mark_line(color='cyan').encode(
-            y=alt.Y('Velocity_Smooth', title='Car Speed'),
-            tooltip=['Time', 'Velocity_Smooth']
+        # Motion Area
+        area = base.mark_area(color='gray', opacity=0.3).encode(
+            y=alt.Y('Motion_Intensity', title='Motion Intensity')
         )
         
-        # Correctly implemented area highlight using transform_filter
-        stop_area = base.mark_area(color='green', opacity=0.1).transform_filter(
-            alt.datum.Valid_Stop == True
-        ).encode(
-            y=alt.value(0),
-            y2=alt.value(400) 
+        # Smooth line
+        line = base.mark_line(color='blue', opacity=0.5).encode(
+            y='Motion_Smooth'
         )
 
-        line_motion = base.mark_area(opacity=0.3, color='gray').encode(
-            y=alt.Y('Motion_Intensity', title='Activity'),
-            tooltip=['Time', 'Motion_Intensity']
+        # Stop Window Highlight
+        stop_rect = alt.Chart(pd.DataFrame({'start': [t_start], 'end': [t_end]})).mark_rect(
+            color='green', opacity=0.1
+        ).encode(
+            x='start', x2='end'
         )
         
         rules = pd.DataFrame([
-            {"Time": t_start, "Event": "Stop (In Box)", "Color": "green"},
-            {"Time": t_end, "Event": "Go", "Color": "red"},
-            {"Time": t_up, "Event": "Jacks Up", "Color": "orange"},
-            {"Time": t_down, "Event": "Jacks Down", "Color": "orange"}
+            {"Time": t_start, "Event": "Stop Start", "Color": "green"},
+            {"Time": t_end, "Event": "Stop End", "Color": "red"},
         ])
         
-        rule_chart = alt.Chart(rules).mark_rule(strokeWidth=2).encode(
-            x='Time',
-            color=alt.Color('Color', scale=None),
-            tooltip=['Event', 'Time']
+        rule_chart = alt.Chart(rules).mark_rule(strokeWidth=3).encode(
+            x='Time', color=alt.Color('Color', scale=None), tooltip=['Event', 'Time']
         )
         
-        st.altair_chart((stop_area + line_motion + line_velocity + rule_chart).interactive(), use_container_width=True)
+        st.altair_chart((area + line + stop_rect + rule_chart).interactive(), use_container_width=True)
         
-        st.subheader("👁️ AI Overlay")
-        col_v1, col_v2 = st.columns([3, 1])
-        with col_v1:
-            if os.path.exists(vid_path):
-                st.video(vid_path)
-        with col_v2:
+        st.subheader("👁️ Analysis Overlay")
+        c1, c2 = st.columns([3,1])
+        with c1:
+            if os.path.exists(vid_path): st.video(vid_path)
+        with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
                     st.download_button("Download Video", f, file_name="analyzed_pitstop.mp4")
