@@ -1,49 +1,72 @@
 import cv2
 import numpy as np
-import torch
-from detectron2.config import get_cfg
-from detectron2.engine import DefaultPredictor
-from detectron2 import model_zoo
-from detectron2.data import MetadataCatalog
+import mmcv
+from mmdet.apis import init_detector, inference_detector
+import tempfile
+import os
+import streamlit as st
 
 # --- Model Loading ---
 @st.cache_resource
-def get_predictor():
+def get_mmdet_model():
     """
-    Initializes and returns the Detectron2 predictor.
+    Initializes and returns the MMDetection model.
     """
-    cfg = get_cfg()
-    # This config file is compatible with the older detectron2 version
-    config_file = "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"
-    cfg.merge_from_file(model_zoo.get_config_file(config_file))
-    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(config_file)
+    # Using a popular and effective model: Faster R-CNN
+    config_file = 'configs/faster_rcnn/faster_rcnn_r50_fpn_1x_coco.py'
+    # The checkpoint file will be downloaded automatically by MMDetection the first time.
+    checkpoint_file = 'checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth'
+
+    # MMDetection needs the config and checkpoint files locally. We'll download them.
+    # Base URL for MMDetection model zoo
+    base_url = 'https://raw.githubusercontent.com/open-mmlab/mmdetection/v2.20.0/'
+
+    # Create directories if they don't exist
+    os.makedirs('configs/faster_rcnn', exist_ok=True)
+    os.makedirs('checkpoints', exist_ok=True)
     
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7
-    cfg.MODEL.DEVICE = "cpu"
-    
-    predictor = DefaultPredictor(cfg)
-    return predictor, MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
+    # Download config if it doesn't exist
+    if not os.path.exists(config_file):
+        print(f"Downloading {config_file}...")
+        os.system(f"wget -O {config_file} {base_url}{config_file}")
+
+    # Download checkpoint if it doesn't exist
+    if not os.path.exists(checkpoint_file):
+        print(f"Downloading {checkpoint_file}...")
+        os.system(f"wget -O {checkpoint_file} https://download.openmmlab.com/mmdetection/v2.0/faster_rcnn/faster_rcnn_r50_fpn_1x_coco/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth")
+
+    # Initialize the detector
+    model = init_detector(config_file, checkpoint_file, device='cpu')
+    return model
 
 # --- Car Detection ---
-def get_car_centroid(predictor, metadata, frame, prev_centroid):
+def get_car_centroid(model, frame, prev_centroid):
     """
-    Detects the car in the frame using Detectron2 and returns its centroid.
+    Detects the car in the frame using MMDetection and returns its centroid.
     """
-    outputs = predictor(frame)
+    # MMDetection's inference function returns results for all 80 COCO classes.
+    result = inference_detector(model, frame)
     
-    instances = outputs["instances"]
-    car_class_index = metadata.thing_classes.index("car")
+    # The class index for 'car' in the COCO dataset is 2.
+    car_class_index = 2
     
-    car_boxes = instances[instances.pred_classes == car_class_index].pred_boxes.tensor.numpy()
-    car_scores = instances[instances.pred_classes == car_class_index].scores.numpy()
+    # Get the bounding boxes for the 'car' class
+    car_boxes = result[car_class_index]
 
-    if len(car_boxes) == 0:
+    if car_boxes.shape[0] == 0:
+        return prev_centroid # Return previous if no car is detected
+
+    # Find the car with the highest confidence score
+    best_car_index = np.argmax(car_boxes[:, 4]) # Confidence score is the 5th element
+    best_car_box = car_boxes[best_car_index]
+    
+    # Filter out low-confidence detections
+    if best_car_box[4] < 0.6:
         return prev_centroid
 
-    best_car_index = np.argmax(car_scores)
-    box = car_boxes[best_car_index]
+    x1, y1, x2, y2, _ = best_car_box
     
-    x1, y1, x2, y2 = box
+    # Calculate the centroid of the bounding box
     cX = int((x1 + x2) / 2)
     cY = int((y1 + y2) / 2)
 
@@ -52,11 +75,9 @@ def get_car_centroid(predictor, metadata, frame, prev_centroid):
 # --- Pit Stop Calculation (Main Logic) ---
 def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buffer_frames=5):
     """
-    Calculates the total pit stop time from a video using Detectron2.
+    Calculates the total pit stop time from a video using MMDetection.
     """
-    # Note: I'm adding a decorator to the get_predictor function to cache it with Streamlit
-    # This is a performance improvement. Let's make sure your app.py calls it.
-    predictor, metadata = get_predictor()
+    model = get_mmdet_model()
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -79,6 +100,9 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     current_centroid = (width // 2, height // 2)
 
+    st_progress_bar = st.progress(0)
+    st_text = st.empty()
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -86,10 +110,12 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
 
         frame_number += 1
         
-        if frame_number < total_frames * 0.1:
-            continue
+        # Update progress bar
+        progress = frame_number / total_frames
+        st_progress_bar.progress(progress)
+        st_text.text(f"Processing frame {frame_number}/{int(total_frames)}")
         
-        current_centroid = get_car_centroid(predictor, metadata, frame, current_centroid)
+        current_centroid = get_car_centroid(model, frame, current_centroid)
         
         if prev_centroid_x is not None:
             delta_x = abs(current_centroid[0] - prev_centroid_x)
@@ -103,6 +129,7 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
                 if stopped_frames_count >= buffer_frames:
                     pit_stop_started = True
                     start_frame = frame_number - buffer_frames
+                    st_text.text("Pit stop start detected!")
                     stopped_frames_count = 0
 
             else:
@@ -114,10 +141,14 @@ def calculate_pit_stop_time(video_path, stop_threshold=3, move_threshold=5, buff
                 if moving_frames_count >= buffer_frames:
                     end_frame = frame_number - buffer_frames
                     cap.release()
+                    st_progress_bar.empty()
+                    st_text.empty()
                     total_time_seconds = (end_frame - start_frame) / fps
                     return total_time_seconds, start_frame, end_frame, fps
         
         prev_centroid_x = current_centroid[0]
 
     cap.release()
+    st_progress_bar.empty()
+    st_text.empty()
     raise ValueError("Pit stop start or end could not be determined.")
