@@ -1,6 +1,7 @@
 # --- Base Packages ---
 streamlit
-numpy
+# Pin NumPy to a 1.x version to maintain ABI compatibility with mmcv
+numpy<2.0
 opencv-python-headless
 
 # --- Group 1: Install an AVAILABLE PyTorch version for Python 3.10 ---
