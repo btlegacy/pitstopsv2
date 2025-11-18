@@ -2,17 +2,18 @@ streamlit
 opencv-python-headless
 numpy
 
-# --- PyTorch and Detectron2 Dependencies ---
-# Install PyTorch and Torchvision first from the official CPU repository
-# This ensures they are present before detectron2 attempts to build.
---find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+# --- Group 1: Install PyTorch and its dependencies first ---
+# Using --extra-index-url is a reliable way to get the correct PyTorch version.
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch==1.10.1+cpu
 torchvision==0.11.2+cpu
 
-# Install other dependencies
+# --- Group 2: Install Detectron2's other dependencies ---
+# These are needed before Detectron2 itself is built.
 fvcore>=0.1.5,<0.1.6
-iopath
-future
+iopath>=0.1.7,<0.1.10
+pycocotools
 
-# Install a pre-built wheel for detectron2 that matches the PyTorch version
-detectron2 @ https://dl.fbaipublicfiles.com/detectron2/wheels/cpu/torch1.10/detectron2-0.6-cp310-cp310-linux_x86_64.whl
+# --- Group 3: Build and install Detectron2 from source ---
+# By placing this last, we ensure all its dependencies (especially torch) are already installed.
+detectron2 @ git+https://github.com/facebookresearch/detectron2.git
