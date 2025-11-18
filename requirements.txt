@@ -1,19 +1,12 @@
-# --- Base Packages ---
+# Base packages
 streamlit
 opencv-python-headless
 numpy
 
-# --- Group 1: Install a stable CPU version of PyTorch and torchvision ---
-# The --extra-index-url tells pip to look for these specific versions in PyTorch's repository.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.1.2+cpu
-torchvision==0.16.2+cpu
-
-# --- Group 2: Install Detectron2 and its dependencies ---
-# The --find-links flag tells pip to look in this specific URL for a compatible detectron2 wheel.
-# This avoids building from source and the associated errors.
---find-links https://dl.fbaipublicfiles.com/detectron2/wheels/cpu/torch2.1/index.html
+# Detectron2 dependencies (torch is installed separately in setup.sh)
 fvcore
 iopath
 pycocotools
-detectron2
+
+# Build and install Detectron2 from source
+detectron2 @ git+https://github.com/facebookresearch/detectron2.git
