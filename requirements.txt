@@ -1,19 +1,21 @@
+# Base packages
 streamlit
 opencv-python-headless
 numpy
 
-# --- Group 1: Install PyTorch and its dependencies first ---
-# Using --extra-index-url is a reliable way to get the correct PyTorch version.
+# --- Step 1: Install PyTorch and its dependencies ---
+# Use a recent, stable CPU version of PyTorch for Python 3.10
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==1.10.1+cpu
-torchvision==0.11.2+cpu
+torch==2.1.2+cpu
+torchvision==0.16.2+cpu
 
-# --- Group 2: Install Detectron2's other dependencies ---
-# These are needed before Detectron2 itself is built.
-fvcore>=0.1.5,<0.1.6
-iopath>=0.1.7,<0.1.10
+# --- Step 2: Install Detectron2's other dependencies ---
+fvcore
+iopath
 pycocotools
 
-# --- Group 3: Build and install Detectron2 from source ---
-# By placing this last, we ensure all its dependencies (especially torch) are already installed.
+# --- Step 3: Install Detectron2 without build isolation ---
+# This flag forces pip to use the already-installed torch,
+# preventing the "ModuleNotFoundError: No module named 'torch'" error during setup.
+--no-build-isolation
 detectron2 @ git+https://github.com/facebookresearch/detectron2.git
