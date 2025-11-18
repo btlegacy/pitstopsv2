@@ -43,7 +43,6 @@ def process_video_with_ai(video_path, progress_callback):
     prev_gray = None
     
     # Define the "Pit Stall Zone" (The middle 50% of the screen width)
-    # We will draw this on the video for reference
     stall_x_start = int(width * 0.25)
     stall_x_end = int(width * 0.75)
     
@@ -109,6 +108,7 @@ def process_video_with_ai(video_path, progress_callback):
         cv2.putText(annotated_frame, "PIT STALL ZONE", (stall_x_start + 10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
         # Status Text
+        # We use a visual threshold of 2.0 for the overlay text
         status_color = (0, 255, 0) if in_stall and velocity < 2.0 else (0, 0, 255)
         status_text = "STOPPED IN BOX" if in_stall and velocity < 2.0 else "MOVING / OUT OF BOX"
         cv2.putText(annotated_frame, status_text, (50, height - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 3)
@@ -255,11 +255,12 @@ def main():
             tooltip=['Time', 'Velocity_Smooth']
         )
         
-        # Highlight the valid stop zone
-        stop_area = base.mark_area(color='green', opacity=0.1).encode(
+        # --- FIX: Correctly implemented area highlight using transform_filter ---
+        stop_area = base.mark_area(color='green', opacity=0.1).transform_filter(
+            alt.datum.Valid_Stop == True
+        ).encode(
             y=alt.value(0),
-            y2=alt.value(100), # arbitrarty high value to fill vertical
-            where='datum.Valid_Stop == true'
+            y2=alt.value(400) # Height in pixels to cover background
         )
 
         line_motion = base.mark_area(opacity=0.3, color='gray').encode(
@@ -280,7 +281,7 @@ def main():
             tooltip=['Event', 'Time']
         )
         
-        st.altair_chart((line_motion + line_velocity + rule_chart).interactive(), use_container_width=True)
+        st.altair_chart((stop_area + line_motion + line_velocity + rule_chart).interactive(), use_container_width=True)
         
         st.subheader("👁️ AI Overlay")
         col_v1, col_v2 = st.columns([3, 1])
