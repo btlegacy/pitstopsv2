@@ -2,3 +2,5 @@ libgl1
 libglib2.0-0
 libgl1-mesa-glx
 wget
+# For compiling the C++ extensions in mmcv from source
+g++
