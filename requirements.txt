@@ -1,19 +1,15 @@
 # --- Base Packages ---
 streamlit
-opencv-python-headless
 numpy
+opencv-python-headless
 
-# --- Group 1: Install PyTorch and torchvision for Python 3.11 ---
+# --- Specific versions from the working example ---
+pyyaml==5.1
+torch==1.9.0+cpu
+torchvision==0.10.0+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.1.2+cpu
-torchvision==0.16.2+cpu
 
-# --- Group 2: Install Detectron2 and its dependencies ---
-# Find the wheels at this URL
---find-links https://dl.fbaipublicfiles.com/detectron2/wheels/cpu/torch2.1/index.html
-pycocotools
-fvcore
-iopath
-
-# IMPORTANT: Pin detectron2 to the exact version available in the --find-links URL
-detectron2==0.6
+# --- Find the compatible Detectron2 wheel ---
+# The -f flag is the short version of --find-links
+-f https://dl.fbaipublicfiles.com/detectron2/wheels/cpu/torch1.9/index.html
+detectron2
