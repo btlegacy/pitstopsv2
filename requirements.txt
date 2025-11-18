@@ -4,17 +4,19 @@ numpy
 opencv-python-headless
 
 # --- Group 1: Install PyTorch and Torchvision for Python 3.10 ---
-# Pinning to torch 1.10.1, which has a compatible detectron2 wheel
+# This ensures PyTorch is present before anything else.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==1.10.1+cpu
 torchvision==0.11.2+cpu
 
-# --- Group 2: Install Detectron2 and its dependencies ---
-# Use the link for torch 1.10 that you provided
---find-links https://dl.fbaipublicfiles.com/detectron2/wheels/cpu/torch1.10/index.html
+# --- Group 2: Install Detectron2 dependencies and build tool ---
+# Ninja is recommended for building Detectron2 from source
 pyyaml==5.4.1
 fvcore
 iopath
+ninja
 
-# IMPORTANT: Pin detectron2 to the exact version available (0.6)
-detectron2==0.6
+# --- Group 3: Build Detectron2 from source using the official git URL ---
+# This line directly follows the documentation's primary instruction.
+# By placing it last, we ensure all dependencies are installed first.
+detectron2 @ git+https://github.com/facebookresearch/detectron2.git
