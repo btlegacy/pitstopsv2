@@ -34,16 +34,11 @@ def match_features(frame_gray, ref_des, orb_detector):
     # Matcher
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     matches = bf.match(ref_des, des_frame)
-    
-    # Sort matches by distance
     matches = sorted(matches, key=lambda x: x.distance)
-    
-    # Keep top matches
     good_matches = matches[:50]
     
-    # Extract points
     src_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-    return len(good_matches) > 15, src_pts # Threshold of 15 matches
+    return len(good_matches) > 15, src_pts
 
 # --- Analysis Engine ---
 def process_video_with_ai(video_path, ref_img_path, progress_callback):
@@ -73,8 +68,12 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
     prev_gray = None
     
     # Zones
-    stall_x_start = int(width * 0.20) # Widen slightly (20% to 80%) to catch entry
+    stall_x_start = int(width * 0.20) 
     stall_x_end = int(width * 0.80)
+    
+    # EXCLUSION ZONE: Bottom 30%
+    # We will ignore any detections where the center Y is > detection_limit_y
+    detection_limit_y = int(height * 0.70)
     
     frame_idx = 0
     
@@ -95,30 +94,39 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
         prev_gray = gray_blur
 
         # 2. AI Detection (YOLO)
-        results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15) # Lower conf to catch fisheye car
+        results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
         
         car_detected = False
         car_center_x = -1
         
         if results[0].boxes.id is not None:
-            # Get largest car box
             boxes = results[0].boxes.xywh.cpu().numpy()
-            # Find box with largest area (closest/main car)
-            areas = boxes[:, 2] * boxes[:, 3]
-            largest_idx = np.argmax(areas)
-            bx, by, bw, bh = boxes[largest_idx]
             
-            car_center_x = bx
-            car_detected = True
+            # --- NEW FILTER: Ignore boxes in bottom 30% ---
+            # box format is [x_center, y_center, width, height]
+            valid_indices = [i for i, box in enumerate(boxes) if box[1] < detection_limit_y]
+            
+            if valid_indices:
+                valid_boxes = boxes[valid_indices]
+                
+                # Find box with largest area among VALID boxes
+                areas = valid_boxes[:, 2] * valid_boxes[:, 3]
+                largest_idx = np.argmax(areas)
+                bx, by, bw, bh = valid_boxes[largest_idx]
+                
+                car_center_x = bx
+                car_detected = True
 
-        # 3. Reference Match Fallback
+        # 3. Reference Match Fallback (Also apply Y filter)
         ref_match_detected = False
         if not car_detected and ref_des is not None:
             match_found, points = match_features(gray, ref_des, orb)
             if match_found:
-                ref_match_detected = True
-                # Calculate centroid of matched points
-                car_center_x = np.mean(points[:, 0, 0])
+                # Check centroid of matches
+                mean_y = np.mean(points[:, 0, 1])
+                if mean_y < detection_limit_y:
+                    ref_match_detected = True
+                    car_center_x = np.mean(points[:, 0, 0])
         
         # 4. In Stall Logic
         in_stall = False
@@ -129,10 +137,14 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
         # Draw Overlay
         annotated_frame = results[0].plot()
         
-        # Draw Stall Zone
+        # Draw Stall Zone (Vertical Lines)
         color = (0,255,0) if in_stall else (255,255,0)
         cv2.line(annotated_frame, (stall_x_start, 0), (stall_x_start, height), color, 2)
         cv2.line(annotated_frame, (stall_x_end, 0), (stall_x_end, height), color, 2)
+        
+        # Draw Exclusion Line (Horizontal)
+        cv2.line(annotated_frame, (0, detection_limit_y), (width, detection_limit_y), (0, 0, 255), 2)
+        cv2.putText(annotated_frame, "IGNORE DETECTIONS BELOW LINE", (10, detection_limit_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
         status_txt = "CAR FOUND" if (car_detected or ref_match_detected) else "SEARCHING..."
         cv2.putText(annotated_frame, status_txt, (stall_x_start, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
@@ -166,13 +178,11 @@ def analyze_timings_valley(df, fps):
     # Smooth motion
     df['Motion_Smooth'] = savgol_filter(df['Motion_Intensity'], 15, 3)
     
-    # Heuristic: A "Spike" is motion > 20% of max motion
     max_motion = df['Motion_Smooth'].max()
     threshold_high = max_motion * 0.25  # Threshold for Arrival/Departure
     threshold_low = max_motion * 0.10   # Threshold for "Stopped"
     
     # Find peaks (Arrival and Departure)
-    # We look for peaks with a minimum distance between them (e.g., 5 seconds * fps)
     peaks, properties = find_peaks(df['Motion_Smooth'], height=threshold_high, distance=fps*5)
     
     t_start, t_end = None, None
@@ -182,16 +192,14 @@ def analyze_timings_valley(df, fps):
         arrival_peak_idx = peaks[0]
         departure_peak_idx = peaks[-1]
         
-        # REFINEMENT: Find exact Start (when motion DROPS after arrival)
-        # Scan forward from arrival peak until motion < threshold_low
+        # REFINEMENT: Find exact Start
         start_idx = arrival_peak_idx
         for i in range(arrival_peak_idx, len(df)):
             if df['Motion_Smooth'].iloc[i] < threshold_low:
                 start_idx = i
                 break
                 
-        # REFINEMENT: Find exact End (when motion RISES before departure)
-        # Scan backward from departure peak
+        # REFINEMENT: Find exact End
         end_idx = departure_peak_idx
         for i in range(departure_peak_idx, start_idx, -1):
             if df['Motion_Smooth'].iloc[i] < threshold_low:
@@ -201,13 +209,11 @@ def analyze_timings_valley(df, fps):
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
     else:
-        # Fallback if peaks aren't distinct: Use simple thresholding logic
-        # Find longest contiguous block of "Low Motion" in the middle 80% of video
+        # Fallback: Longest contiguous low motion block
         mid_df = df.iloc[int(len(df)*0.1):int(len(df)*0.9)]
         low_motion_mask = mid_df['Motion_Smooth'] < threshold_low
         
-        # Identify blocks
-        mid_df = mid_df.copy() # avoid setting on copy warning
+        mid_df = mid_df.copy()
         mid_df['block'] = (low_motion_mask != low_motion_mask.shift()).cumsum()
         blocks = mid_df[low_motion_mask].groupby('block')
         
@@ -217,15 +223,12 @@ def analyze_timings_valley(df, fps):
             t_start = segment['Time'].min()
             t_end = segment['Time'].max()
 
-    # Tire Change Detection (Jacks)
-    # Look for spikes inside the determined window
+    # Tire Change Detection
     t_up, t_down = t_start, t_end
     if t_start and t_end:
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not stop_window.empty:
             motion_curve = stop_window['Motion_Intensity'].values
-            # Find internal peaks (crew activity)
-            # Use a lower prominence to catch jacks
             jacks_peaks, _ = find_peaks(motion_curve, prominence=np.max(motion_curve)*0.15)
             
             if len(jacks_peaks) > 0:
@@ -237,20 +240,18 @@ def analyze_timings_valley(df, fps):
 
 # --- Main UI ---
 def main():
-    st.title("🏁 Pit Stop AI Analyzer V4")
-    st.markdown("### Hybrid Motion & Reference Matching")
-    st.info("Uses Global Motion to find the 'Quiet Valley' (Stop) between Arrival/Departure spikes. Can use Reference Image to aid detection.")
+    st.title("🏁 Pit Stop AI Analyzer V5")
+    st.markdown("### Refined Detection Zone")
+    st.info("This version ignores detections in the bottom 30% of the screen to avoid confusing crew equipment with the car.")
 
     # Sidebar for Reference Image
     st.sidebar.header("Configuration")
     ref_file = st.sidebar.file_uploader("Upload Car Reference Image (Optional)", type=['jpg', 'png'])
     
-    # Try to find default ref if not uploaded
-    default_ref_path = os.path.join("files", "refs", "car.jpg") # Adjust based on your repo structure if known
+    default_ref_path = os.path.join("files", "refs", "car.jpg")
     ref_path = None
 
     if ref_file:
-        # Save uploaded ref
         tref = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
         tref.write(ref_file.read())
         tref.close()
@@ -305,7 +306,7 @@ def main():
             st.error(f"Error: {e}")
         finally:
             if os.path.exists(tfile_in.name): os.remove(tfile_in.name)
-            if ref_path and ref_file: os.remove(ref_path) # clean up uploaded ref
+            if ref_path and ref_file: os.remove(ref_path)
 
     if st.session_state['analysis_done']:
         df = st.session_state['df']
@@ -324,17 +325,14 @@ def main():
         # Chart
         base = alt.Chart(df).encode(x='Time')
         
-        # Motion Area
         area = base.mark_area(color='gray', opacity=0.3).encode(
             y=alt.Y('Motion_Intensity', title='Motion Intensity')
         )
         
-        # Smooth line
         line = base.mark_line(color='blue', opacity=0.5).encode(
             y='Motion_Smooth'
         )
 
-        # Stop Window Highlight
         stop_rect = alt.Chart(pd.DataFrame({'start': [t_start], 'end': [t_end]})).mark_rect(
             color='green', opacity=0.1
         ).encode(
