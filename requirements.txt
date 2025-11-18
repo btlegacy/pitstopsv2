@@ -5,3 +5,4 @@ pandas
 altair
 scipy
 ultralytics
+lapx
