@@ -4,19 +4,16 @@ numpy
 opencv-python-headless
 
 # --- Group 1: Install PyTorch and Torchvision for Python 3.10 ---
-# This ensures PyTorch is present before anything else.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==1.10.1+cpu
 torchvision==0.11.2+cpu
 
-# --- Group 2: Install Detectron2 dependencies and build tool ---
-# Ninja is recommended for building Detectron2 from source
-pyyaml==5.4.1
-fvcore
-iopath
-ninja
+# --- Group 2: Install MMDetection and its dependencies ---
+# First, install mmcv, the core library for MMDetection
+mmcv-full==1.4.0 -f https://download.openmmlab.com/mmcv/dist/cpu/torch1.10.0/index.html
 
-# --- Group 3: Build Detectron2 from source using the official git URL ---
-# This line directly follows the documentation's primary instruction.
-# By placing it last, we ensure all dependencies are installed first.
-detectron2 @ git+https://github.com/facebookresearch/detectron2.git
+# Now, install the main mmdetection library
+mmdet==2.20.0
+
+# Other common dependencies
+matplotlib
