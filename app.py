@@ -33,7 +33,7 @@ def extract_kinetic_telemetry(video_path, progress_callback):
     if not ret: return pd.DataFrame(), fps, width, height
     
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    prev_roi = prev_gray[roi_y_start:roi_y_end, roi_x_start:roi_x_end] if 'roi_y_start' in locals() else prev_gray[roi_y1:roi_y2, roi_x1:roi_x2]
+    prev_roi = prev_gray[roi_y1:roi_y2, roi_x1:roi_x2]
     
     frame_idx = 0
     
@@ -56,7 +56,7 @@ def extract_kinetic_telemetry(video_path, progress_callback):
         active_mask = mag > 1.0 
         if np.any(active_mask):
             med_x = np.median(fx[active_mask])
-            med_y = np.median(fy[active_mask]) # Capture Global Y for the "Drop Jolt"
+            med_y = np.median(fy[active_mask])
         else:
             med_x = 0.0
             med_y = 0.0
@@ -94,13 +94,12 @@ def extract_kinetic_telemetry(video_path, progress_callback):
 # --- PASS 2: Analysis ---
 def analyze_states(df, fps):
     # Smooth data
-    # Use a smaller window for Vertical/Zoom to catch sudden drops
     window_fast = 7
     window_slow = 15
     
     if len(df) > window_slow:
         df['X_Smooth'] = savgol_filter(df['Flow_X'], window_slow, 3)
-        df['Y_Smooth'] = savgol_filter(df['Flow_Y'], window_fast, 3) # Fast response for drop
+        df['Y_Smooth'] = savgol_filter(df['Flow_Y'], window_fast, 3) 
         df['Zoom_Smooth'] = savgol_filter(df['Zoom_Score'], window_fast, 3)
     else:
         df['X_Smooth'] = df['Flow_X']
@@ -134,66 +133,70 @@ def analyze_states(df, fps):
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
 
-    # --- 2. JACKS (Up = Expansion, Down = Jolt/Contraction) ---
+    # --- 2. JACKS (Threshold-Gated Drop Detection) ---
     t_up, t_down = None, None
     
     if t_start and t_end:
-        # Stop window
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         
         if not stop_window.empty:
             z_sig = stop_window['Zoom_Smooth'].values
             y_sig = stop_window['Y_Smooth'].values
             
-            # Prominence thresholds
-            zoom_prom = np.max(np.abs(z_sig)) * 0.25
-            y_prom = np.max(np.abs(y_sig)) * 0.25
+            # Calculate Dynamic Prominence based on signal strength
+            max_z_amp = np.max(np.abs(z_sig))
+            max_y_amp = np.max(np.abs(y_sig))
             
-            # A. FIND UP (Expansion) - User says this works well
-            peaks_up, _ = find_peaks(z_sig, height=0.2, prominence=zoom_prom, distance=fps)
+            # A. FIND LIFT (Expansion)
+            # Look for Positive Zoom Peaks
+            peaks_up, props_up = find_peaks(z_sig, height=max_z_amp*0.3, distance=fps)
             
-            # B. FIND DOWN (Contraction OR Vertical Slam)
-            # Drops are messy. We look for:
-            # 1. Negative Zoom (Contraction)
-            # 2. Major Vertical Jolt (High abs Y-flow)
+            lift_intensity = 0.0
             
-            # Invert zoom to find negative peaks
-            peaks_contract, _ = find_peaks(-z_sig, height=0.2, prominence=zoom_prom, distance=fps)
-            
-            # Find ANY vertical jolt (Up or Down movement is just movement in Y)
-            peaks_jolt, _ = find_peaks(np.abs(y_sig), height=0.5, prominence=y_prom, distance=fps)
-            
-            # Collect candidate times
             if len(peaks_up) > 0:
-                # First expansion is usually the lift
-                t_up = stop_window.iloc[peaks_up[0]]['Time']
+                # First major expansion is the Lift
+                first_peak_idx = peaks_up[0]
+                t_up = stop_window.iloc[first_peak_idx]['Time']
+                lift_intensity = z_sig[first_peak_idx] # Remember how strong the lift was
             else:
+                # Fallback: If no lift detected, assume start
                 t_up = t_start
+                lift_intensity = max_z_amp # Assume standard intensity
                 
-            # For Drop: Look for the LAST significant event (Contraction or Jolt)
-            # that happens AFTER the lift.
+            # B. FIND DROP (Contraction / Jolt)
+            # The Drop must be significant. It cannot be a tiny vibration.
+            # Threshold: Must be at least 40% as strong as the Lift (or Max signal)
             
-            drop_candidates = []
+            drop_threshold_z = lift_intensity * 0.4
+            drop_threshold_y = max_y_amp * 0.4
             
-            # Add contraction candidates
+            # 1. Contraction Candidates (Negative Zoom)
+            peaks_contract, props_c = find_peaks(-z_sig, height=drop_threshold_z, distance=fps)
+            
+            # 2. Vertical Jolt Candidates (Heavy Y Movement)
+            peaks_jolt, props_j = find_peaks(np.abs(y_sig), height=drop_threshold_y, distance=fps)
+            
+            valid_drops = []
+            
+            # Collect all valid heavy impacts after the Lift
             for p in peaks_contract:
-                time = stop_window.iloc[p]['Time']
-                if time > t_up + 1.0: # Must be at least 1s after lift
-                    drop_candidates.append(time)
-            
-            # Add vertical jolt candidates
+                t_event = stop_window.iloc[p]['Time']
+                if t_event > t_up + 1.0: # Must be at least 1s after lift
+                    valid_drops.append(t_event)
+                    
             for p in peaks_jolt:
-                time = stop_window.iloc[p]['Time']
-                if time > t_up + 1.0:
-                    drop_candidates.append(time)
+                t_event = stop_window.iloc[p]['Time']
+                if t_event > t_up + 1.0:
+                    valid_drops.append(t_event)
             
-            if drop_candidates:
-                # The Drop is usually the LAST event before the car leaves.
-                # We sort and pick the last one.
-                drop_candidates.sort()
-                t_down = drop_candidates[-1]
+            if valid_drops:
+                # Sort and pick the LAST *valid* heavy impact.
+                # Any small noise later in the video didn't pass the 'drop_threshold',
+                # so we won't accidentally pick it.
+                valid_drops.sort()
+                t_down = valid_drops[-1]
             else:
-                # If no drop detected, fallback to end
+                # If no heavy drop found, fallback to end
                 t_down = t_end
 
     return t_start, t_end, (t_up, t_down)
@@ -242,7 +245,7 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
         cv2.putText(frame, "TIRES (Jacks)", (width-430, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
 
-        cv2.putText(frame, "Logic: Zoom(Up) -> Last Jolt(Down)", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        cv2.putText(frame, "Logic: Lift(Exp) -> Heavy Impact(Drop)", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -255,9 +258,9 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V17")
-    st.markdown("### Hybrid Drop Detection")
-    st.info("Uses **Expansion (Zoom)** for Lift, and **Vertical Jolt (Impact)** for Drop. This fixes missing drops due to motion blur.")
+    st.title("🏁 Pit Stop Analyzer V18")
+    st.markdown("### Magnitude-Gated Drop Detection")
+    st.info("Filters out small vibrations. The 'Drop' must be a heavy impact (Contraction/Jolt) relative to the Lift intensity.")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
