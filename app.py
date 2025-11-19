@@ -61,7 +61,6 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
         if ref_img is not None:
             orb = cv2.ORB_create(nfeatures=1000)
             _, ref_des = get_ref_features(ref_img)
-            # print(f"Loaded reference image from {ref_img_path}") 
     
     # Setup output
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -136,20 +135,39 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
         # Draw Overlay
         annotated_frame = results[0].plot()
         
+        # Zone Lines
         color = (0,255,0) if in_stall else (255,255,0)
         cv2.line(annotated_frame, (stall_x_start, 0), (stall_x_start, height), color, 2)
         cv2.line(annotated_frame, (stall_x_end, 0), (stall_x_end, height), color, 2)
-        
         cv2.line(annotated_frame, (0, detection_limit_y), (width, detection_limit_y), (0, 0, 255), 2)
         
+        # Status Text
         status_txt = "CAR FOUND" if (car_detected or ref_match_detected) else "SEARCHING..."
         cv2.putText(annotated_frame, status_txt, (stall_x_start, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         
+        # --- NEW: Timing & Telemetry Overlay ---
+        # Background rectangle for readability
+        overlay_bg_w = 350
+        overlay_bg_h = 100
+        cv2.rectangle(annotated_frame, (width - overlay_bg_w, 0), (width, overlay_bg_h), (0, 0, 0), -1)
+        
+        current_time = frame_idx / fps
+        
+        # Time
+        time_text = f"T: {current_time:.2f}s"
+        cv2.putText(annotated_frame, time_text, (width - 330, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+        
+        # Motion
+        motion_text = f"Mot: {motion_score:.1f}"
+        cv2.putText(annotated_frame, motion_text, (width - 330, 90), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 1)
+
         out.write(annotated_frame)
 
         telemetry_data.append({
             "Frame": frame_idx,
-            "Time": frame_idx / fps,
+            "Time": current_time,
             "Motion_Intensity": motion_score,
             "In_Stall": in_stall,
             "Car_Center_X": car_center_x
@@ -228,19 +246,16 @@ def analyze_timings_valley(df, fps):
 
 # --- Main UI ---
 def main():
-    st.title("🏁 Pit Stop AI Analyzer V5")
-    st.markdown("### Refined Detection with Auto-Reference")
-    st.info("Ignores bottom 30% of screen. Automatically uses `refs/car.png` if available.")
+    st.title("🏁 Pit Stop AI Analyzer V6")
+    st.markdown("### Overlay Timing Enabled")
+    st.info("Includes Live Timing Overlay on video and exclusion zone logic.")
 
     # --- Reference Image Loading ---
-    # Hardcoded path relative to app.py location
     default_ref_path = os.path.join(BASE_DIR, "refs", "car.png")
     ref_path = None
     
     if os.path.exists(default_ref_path):
         ref_path = default_ref_path
-        # Optional: Display a small confirmation or the image itself
-        # st.sidebar.image(ref_path, caption="Loaded Reference Car", width=100)
     else:
         st.warning(f"Reference image not found at: {default_ref_path}. Analysis will rely on YOLO only.")
 
@@ -267,7 +282,6 @@ def main():
             status = st.empty()
             status.write("Analyzing Motion Profile & Detecting Object...")
             
-            # Pass the hardcoded ref_path here
             df, vid_path, fps = process_video_with_ai(tfile_in.name, ref_path, progress_bar.progress)
             
             status.write("Identifying Pit Stop Window...")
