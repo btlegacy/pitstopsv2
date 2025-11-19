@@ -71,7 +71,7 @@ def extract_kinetic_telemetry(video_path, progress_callback):
         val_l = np.median(flow_left[mask_l]) if np.any(mask_l) else 0.0
         val_r = np.median(flow_right[mask_r]) if np.any(mask_r) else 0.0
         
-        # Expansion = Right moves Right (+) - Left moves Left (-) = Positive
+        # Expansion = Positive Zoom
         zoom_score = val_r - val_l
 
         telemetry_data.append({
@@ -133,7 +133,7 @@ def analyze_states(df, fps):
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
 
-    # --- 2. JACKS (Threshold-Gated Drop Detection) ---
+    # --- 2. JACKS (Signal-to-Noise Drop Detection) ---
     t_up, t_down = None, None
     
     if t_start and t_end:
@@ -143,60 +143,53 @@ def analyze_states(df, fps):
             z_sig = stop_window['Zoom_Smooth'].values
             y_sig = stop_window['Y_Smooth'].values
             
-            # Calculate Dynamic Prominence based on signal strength
-            max_z_amp = np.max(np.abs(z_sig))
-            max_y_amp = np.max(np.abs(y_sig))
+            # Calculate Noise Floor (Standard Deviation)
+            z_std = np.std(z_sig)
+            y_std = np.std(y_sig)
             
-            # A. FIND LIFT (Expansion)
-            # Look for Positive Zoom Peaks
-            peaks_up, props_up = find_peaks(z_sig, height=max_z_amp*0.3, distance=fps)
+            # Thresholds: Must stick out 2x above noise
+            thresh_z = z_std * 2.0
+            thresh_y = y_std * 2.0
             
-            lift_intensity = 0.0
+            # A. FIND LIFT (Positive Zoom)
+            # Find peaks
+            peaks_up, _ = find_peaks(z_sig, height=thresh_z, distance=fps)
             
             if len(peaks_up) > 0:
-                # First major expansion is the Lift
-                first_peak_idx = peaks_up[0]
-                t_up = stop_window.iloc[first_peak_idx]['Time']
-                lift_intensity = z_sig[first_peak_idx] # Remember how strong the lift was
+                t_up = stop_window.iloc[peaks_up[0]]['Time']
             else:
-                # Fallback: If no lift detected, assume start
                 t_up = t_start
-                lift_intensity = max_z_amp # Assume standard intensity
-                
-            # B. FIND DROP (Contraction / Jolt)
-            # The Drop must be significant. It cannot be a tiny vibration.
-            # Threshold: Must be at least 40% as strong as the Lift (or Max signal)
+
+            # B. FIND DROP (Negative Zoom OR Jolt)
+            # Crucial: Ignore Departure Noise
+            # Valid drops must happen BEFORE the car starts leaving
+            valid_window_end = t_end - 1.5  # Buffer: 1.5s before departure
             
-            drop_threshold_z = lift_intensity * 0.4
-            drop_threshold_y = max_y_amp * 0.4
+            # 1. Contraction Candidates (Negative Peaks)
+            peaks_contract, props_c = find_peaks(-z_sig, height=thresh_z, prominence=thresh_z*0.5, distance=fps)
             
-            # 1. Contraction Candidates (Negative Zoom)
-            peaks_contract, props_c = find_peaks(-z_sig, height=drop_threshold_z, distance=fps)
-            
-            # 2. Vertical Jolt Candidates (Heavy Y Movement)
-            peaks_jolt, props_j = find_peaks(np.abs(y_sig), height=drop_threshold_y, distance=fps)
+            # 2. Jolt Candidates (Absolute Y Peaks)
+            peaks_jolt, props_j = find_peaks(np.abs(y_sig), height=thresh_y, prominence=thresh_y*0.5, distance=fps)
             
             valid_drops = []
             
-            # Collect all valid heavy impacts after the Lift
+            # Filter candidates
             for p in peaks_contract:
-                t_event = stop_window.iloc[p]['Time']
-                if t_event > t_up + 1.0: # Must be at least 1s after lift
-                    valid_drops.append(t_event)
-                    
+                t = stop_window.iloc[p]['Time']
+                if t > t_up + 1.0 and t < valid_window_end:
+                    valid_drops.append(t)
+            
             for p in peaks_jolt:
-                t_event = stop_window.iloc[p]['Time']
-                if t_event > t_up + 1.0:
-                    valid_drops.append(t_event)
+                t = stop_window.iloc[p]['Time']
+                if t > t_up + 1.0 and t < valid_window_end:
+                    valid_drops.append(t)
             
             if valid_drops:
-                # Sort and pick the LAST *valid* heavy impact.
-                # Any small noise later in the video didn't pass the 'drop_threshold',
-                # so we won't accidentally pick it.
+                # Pick the LAST valid event before departure buffer
                 valid_drops.sort()
                 t_down = valid_drops[-1]
             else:
-                # If no heavy drop found, fallback to end
+                # Fallback to end if no distinct drop found
                 t_down = t_end
 
     return t_start, t_end, (t_up, t_down)
@@ -245,7 +238,7 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
         cv2.putText(frame, "TIRES (Jacks)", (width-430, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
 
-        cv2.putText(frame, "Logic: Lift(Exp) -> Heavy Impact(Drop)", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        cv2.putText(frame, "Logic: Zoom(Up) -> Last Jolt(Down)", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -258,9 +251,9 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V18")
-    st.markdown("### Magnitude-Gated Drop Detection")
-    st.info("Filters out small vibrations. The 'Drop' must be a heavy impact (Contraction/Jolt) relative to the Lift intensity.")
+    st.title("🏁 Pit Stop Analyzer V19")
+    st.markdown("### Buffer-Gated Drop Detection")
+    st.info("Prioritizes drops before the departure event to avoid confusing 'Car Leaving' with 'Jacks Down'.")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -325,7 +318,8 @@ def main():
         
         rules = pd.DataFrame([
             {'t': t_up, 'c': 'green', 'l': 'Jacks Up'}, 
-            {'t': t_down, 'c': 'red', 'l': 'Jacks Down'}
+            {'t': t_down, 'c': 'red', 'l': 'Jacks Down'},
+            {'t': t_end - 1.5, 'c': 'gray', 'l': 'Buffer Zone'}
         ])
         rule_chart = alt.Chart(rules).mark_rule(strokeWidth=2).encode(x='t', color=alt.Color('c', scale=None))
         
