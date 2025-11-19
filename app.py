@@ -10,6 +10,7 @@ from ultralytics import YOLO
 
 # --- Configuration ---
 st.set_page_config(page_title="Pit Stop Analytics AI", layout="wide")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Load AI Model ---
 @st.cache_resource
@@ -54,11 +55,14 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
     # Load Reference Image if provided
     ref_des = None
     orb = None
-    if ref_img_path:
+    
+    if ref_img_path and os.path.exists(ref_img_path):
         ref_img = cv2.imread(ref_img_path, cv2.IMREAD_GRAYSCALE)
-        orb = cv2.ORB_create(nfeatures=1000)
-        _, ref_des = get_ref_features(ref_img)
-
+        if ref_img is not None:
+            orb = cv2.ORB_create(nfeatures=1000)
+            _, ref_des = get_ref_features(ref_img)
+            # print(f"Loaded reference image from {ref_img_path}") 
+    
     # Setup output
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
@@ -72,7 +76,6 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
     stall_x_end = int(width * 0.80)
     
     # EXCLUSION ZONE: Bottom 30%
-    # We will ignore any detections where the center Y is > detection_limit_y
     detection_limit_y = int(height * 0.70)
     
     frame_idx = 0
@@ -102,14 +105,11 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
             
-            # --- NEW FILTER: Ignore boxes in bottom 30% ---
-            # box format is [x_center, y_center, width, height]
+            # Filter: Ignore boxes in bottom 30%
             valid_indices = [i for i, box in enumerate(boxes) if box[1] < detection_limit_y]
             
             if valid_indices:
                 valid_boxes = boxes[valid_indices]
-                
-                # Find box with largest area among VALID boxes
                 areas = valid_boxes[:, 2] * valid_boxes[:, 3]
                 largest_idx = np.argmax(areas)
                 bx, by, bw, bh = valid_boxes[largest_idx]
@@ -117,12 +117,11 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
                 car_center_x = bx
                 car_detected = True
 
-        # 3. Reference Match Fallback (Also apply Y filter)
+        # 3. Reference Match Fallback
         ref_match_detected = False
         if not car_detected and ref_des is not None:
             match_found, points = match_features(gray, ref_des, orb)
             if match_found:
-                # Check centroid of matches
                 mean_y = np.mean(points[:, 0, 1])
                 if mean_y < detection_limit_y:
                     ref_match_detected = True
@@ -137,14 +136,11 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
         # Draw Overlay
         annotated_frame = results[0].plot()
         
-        # Draw Stall Zone (Vertical Lines)
         color = (0,255,0) if in_stall else (255,255,0)
         cv2.line(annotated_frame, (stall_x_start, 0), (stall_x_start, height), color, 2)
         cv2.line(annotated_frame, (stall_x_end, 0), (stall_x_end, height), color, 2)
         
-        # Draw Exclusion Line (Horizontal)
         cv2.line(annotated_frame, (0, detection_limit_y), (width, detection_limit_y), (0, 0, 255), 2)
-        cv2.putText(annotated_frame, "IGNORE DETECTIONS BELOW LINE", (10, detection_limit_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
         status_txt = "CAR FOUND" if (car_detected or ref_match_detected) else "SEARCHING..."
         cv2.putText(annotated_frame, status_txt, (stall_x_start, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
@@ -171,35 +167,28 @@ def process_video_with_ai(video_path, ref_img_path, progress_callback):
 def analyze_timings_valley(df, fps):
     """
     Robust Valley Detection:
-    1. Identify the "Arrival Peak" (High motion).
-    2. Identify the "Departure Peak" (High motion).
-    3. The pit stop is the 'Quiet Zone' in between.
+    Finds the quiet zone between Arrival Peak and Departure Peak.
     """
-    # Smooth motion
     df['Motion_Smooth'] = savgol_filter(df['Motion_Intensity'], 15, 3)
     
     max_motion = df['Motion_Smooth'].max()
-    threshold_high = max_motion * 0.25  # Threshold for Arrival/Departure
-    threshold_low = max_motion * 0.10   # Threshold for "Stopped"
+    threshold_high = max_motion * 0.25
+    threshold_low = max_motion * 0.10
     
-    # Find peaks (Arrival and Departure)
     peaks, properties = find_peaks(df['Motion_Smooth'], height=threshold_high, distance=fps*5)
     
     t_start, t_end = None, None
     
     if len(peaks) >= 2:
-        # Assume First Peak is Arrival, Last Peak is Departure
         arrival_peak_idx = peaks[0]
         departure_peak_idx = peaks[-1]
         
-        # REFINEMENT: Find exact Start
         start_idx = arrival_peak_idx
         for i in range(arrival_peak_idx, len(df)):
             if df['Motion_Smooth'].iloc[i] < threshold_low:
                 start_idx = i
                 break
                 
-        # REFINEMENT: Find exact End
         end_idx = departure_peak_idx
         for i in range(departure_peak_idx, start_idx, -1):
             if df['Motion_Smooth'].iloc[i] < threshold_low:
@@ -209,7 +198,7 @@ def analyze_timings_valley(df, fps):
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
     else:
-        # Fallback: Longest contiguous low motion block
+        # Fallback logic
         mid_df = df.iloc[int(len(df)*0.1):int(len(df)*0.9)]
         low_motion_mask = mid_df['Motion_Smooth'] < threshold_low
         
@@ -223,7 +212,6 @@ def analyze_timings_valley(df, fps):
             t_start = segment['Time'].min()
             t_end = segment['Time'].max()
 
-    # Tire Change Detection
     t_up, t_down = t_start, t_end
     if t_start and t_end:
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
@@ -241,25 +229,20 @@ def analyze_timings_valley(df, fps):
 # --- Main UI ---
 def main():
     st.title("🏁 Pit Stop AI Analyzer V5")
-    st.markdown("### Refined Detection Zone")
-    st.info("This version ignores detections in the bottom 30% of the screen to avoid confusing crew equipment with the car.")
+    st.markdown("### Refined Detection with Auto-Reference")
+    st.info("Ignores bottom 30% of screen. Automatically uses `refs/car.png` if available.")
 
-    # Sidebar for Reference Image
-    st.sidebar.header("Configuration")
-    ref_file = st.sidebar.file_uploader("Upload Car Reference Image (Optional)", type=['jpg', 'png'])
-    
-    default_ref_path = os.path.join("files", "refs", "car.jpg")
+    # --- Reference Image Loading ---
+    # Hardcoded path relative to app.py location
+    default_ref_path = os.path.join(BASE_DIR, "refs", "car.png")
     ref_path = None
-
-    if ref_file:
-        tref = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-        tref.write(ref_file.read())
-        tref.close()
-        ref_path = tref.name
-        st.sidebar.success("Reference Image Loaded")
-    elif os.path.exists(default_ref_path):
+    
+    if os.path.exists(default_ref_path):
         ref_path = default_ref_path
-        st.sidebar.info(f"Using repository reference: {default_ref_path}")
+        # Optional: Display a small confirmation or the image itself
+        # st.sidebar.image(ref_path, caption="Loaded Reference Car", width=100)
+    else:
+        st.warning(f"Reference image not found at: {default_ref_path}. Analysis will rely on YOLO only.")
 
     # Session State
     if 'analysis_done' not in st.session_state:
@@ -284,13 +267,14 @@ def main():
             status = st.empty()
             status.write("Analyzing Motion Profile & Detecting Object...")
             
+            # Pass the hardcoded ref_path here
             df, vid_path, fps = process_video_with_ai(tfile_in.name, ref_path, progress_bar.progress)
             
             status.write("Identifying Pit Stop Window...")
             t_start, t_end, (t_up, t_down) = analyze_timings_valley(df, fps)
             
             if t_start is None:
-                st.error("Could not identify a clear pit stop window (Arrival -> Stop -> Departure).")
+                st.error("Could not identify a clear pit stop window.")
             else:
                 st.session_state.update({
                     'df': df,
@@ -306,7 +290,6 @@ def main():
             st.error(f"Error: {e}")
         finally:
             if os.path.exists(tfile_in.name): os.remove(tfile_in.name)
-            if ref_path and ref_file: os.remove(ref_path)
 
     if st.session_state['analysis_done']:
         df = st.session_state['df']
@@ -322,7 +305,6 @@ def main():
 
         st.subheader("📊 Motion Telemetry")
         
-        # Chart
         base = alt.Chart(df).encode(x='Time')
         
         area = base.mark_area(color='gray', opacity=0.3).encode(
