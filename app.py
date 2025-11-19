@@ -18,15 +18,14 @@ def load_reference_features(folder_name):
     path = os.path.join(BASE_DIR, "refs", folder_name, "*")
     files = glob.glob(path)
     
-    # Also check flattened structure if user didn't create subfolders
     if not files:
+        # Check flattened structure
         path = os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
         files = glob.glob(path)
 
     if not files:
         return None, None
 
-    # Use the first image found as the "Master Reference"
     img_path = files[0]
     img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if img is None: return None, None
@@ -35,7 +34,7 @@ def load_reference_features(folder_name):
     kp, des = orb.detectAndCompute(img, None)
     return kp, des
 
-# --- PASS 1: Extraction (Kinetic + Zoom + Fuel Features) ---
+# --- PASS 1: Extraction ---
 def extract_telemetry(video_path, progress_callback):
     cap = cv2.VideoCapture(video_path)
     
@@ -45,17 +44,14 @@ def extract_telemetry(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Load Fuel References (Probe Inserted)
-    # We focus on detecting the "Inserted" state.
+    # Load Fuel References
     fuel_kp, fuel_des = load_reference_features("probein")
     
-    # ORB Detector for the video frames
     orb = cv2.ORB_create(nfeatures=500)
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
     telemetry_data = []
     
-    # ROI: Center Box (Car & Crew Area)
     roi_x1, roi_x2 = int(width * 0.20), int(width * 0.80)
     roi_y1, roi_y2 = int(height * 0.20), int(height * 0.80)
     mid_x = int((roi_x2 - roi_x1) / 2)
@@ -75,13 +71,12 @@ def extract_telemetry(video_path, progress_callback):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         curr_roi = gray[roi_y1:roi_y2, roi_x1:roi_x2]
         
-        # --- 1. OPTICAL FLOW (Motion/Zoom) ---
+        # Optical Flow
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 
                                             0.5, 3, 15, 3, 5, 1.2, 0)
         fx = flow[..., 0]
         fy = flow[..., 1]
         
-        # Horizontal Momentum
         mag = np.sqrt(fx**2 + fy**2)
         active_mask = mag > 1.0 
         if np.any(active_mask):
@@ -91,7 +86,7 @@ def extract_telemetry(video_path, progress_callback):
             med_x = 0.0
             med_y = 0.0
             
-        # Zoom Metric
+        # Zoom
         flow_left = fx[:, :mid_x]
         flow_right = fx[:, mid_x:]
         mask_l = np.abs(flow_left) > 0.5
@@ -100,14 +95,12 @@ def extract_telemetry(video_path, progress_callback):
         val_r = np.median(flow_right[mask_r]) if np.any(mask_r) else 0.0
         zoom_score = val_r - val_l
         
-        # --- 2. FUEL DETECTION (Feature Matching) ---
+        # Fuel Matches
         fuel_matches = 0
         if fuel_des is not None:
-            # Detect features in current frame ROI
             kp_frame, des_frame = orb.detectAndCompute(curr_roi, None)
             if des_frame is not None:
                 matches = bf.match(fuel_des, des_frame)
-                # Filter for strong matches (distance < 50 is a good baseline for ORB)
                 good_matches = [m for m in matches if m.distance < 60]
                 fuel_matches = len(good_matches)
 
@@ -131,7 +124,6 @@ def extract_telemetry(video_path, progress_callback):
 
 # --- PASS 2: Analysis ---
 def analyze_states(df, fps):
-    # Smooth data
     window_slow = 15
     window_fast = 5
     
@@ -148,7 +140,7 @@ def analyze_states(df, fps):
 
     df['Zoom_Velocity'] = np.gradient(df['Zoom_Smooth'])
 
-    # --- 1. PIT STOP ---
+    # 1. PIT STOP
     x_mag = df['X_Smooth'].abs()
     MOVE_THRESH = x_mag.max() * 0.3 
     STOP_THRESH = x_mag.max() * 0.05 
@@ -175,7 +167,7 @@ def analyze_states(df, fps):
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
     
-    # --- 2. JACKS ---
+    # 2. JACKS
     t_up, t_down = None, None
     
     if t_start and t_end:
@@ -190,11 +182,9 @@ def analyze_states(df, fps):
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep_limit)]
         
         if not stop_window.empty:
-            z_vel = stop_window['Zoom_Velocity'].values
             z_pos = stop_window['Zoom_Smooth'].values
             times = stop_window['Time'].values
             
-            # Lift
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
                 t_up = times[peaks_up[0]]
@@ -205,8 +195,7 @@ def analyze_states(df, fps):
                 t_up = t_start
                 lift_amplitude = 0.5 
                 
-            # Drop
-            neg_vel = -z_vel
+            neg_vel = -stop_window['Zoom_Velocity'].values
             cand_drops, _ = find_peaks(neg_vel, height=0.1, distance=fps*0.5)
             valid_drops = []
             
@@ -226,42 +215,26 @@ def analyze_states(df, fps):
             else:
                 t_down = t_creep_limit
 
-    # --- 3. FUELING ---
+    # 3. FUELING
     t_fuel_start, t_fuel_end = None, None
     
     if t_start and t_end:
-        # Fueling must happen within the stop window
         fuel_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
-        
         if not fuel_window.empty:
             f_sig = fuel_window['Fuel_Smooth'].values
             times = fuel_window['Time'].values
-            
-            # Thresholding: Finding the "Plateau" of matches
-            # If matches > 15 (arbitrary "Good Match" count), we assume connected
-            # We look for the threshold relative to the max matches found
             max_matches = np.max(f_sig)
             
-            if max_matches > 10: # Minimum confidence that we actually found the probe
+            if max_matches > 10:
                 fuel_thresh = max_matches * 0.5
-                
                 is_fueling = f_sig > fuel_thresh
-                
-                # Find start (first crossing)
                 start_indices = np.where(is_fueling)[0]
                 if len(start_indices) > 0:
                     t_fuel_start = times[start_indices[0]]
                     t_fuel_end = times[start_indices[-1]]
-                    
-                    # Constraint: Fueling usually ends before car leaves
-                    # If t_fuel_end is practically t_end, trim it slightly for visuals
                     if t_fuel_end > t_end - 0.5:
                         t_fuel_end = t_end - 0.5
-            else:
-                # No fuel probe detected
-                pass
 
-    # Fallbacks
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
@@ -286,9 +259,7 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         if not ret: break
         current_time = frame_idx / fps
         
-        # --- CALCULATE TIMERS ---
-        
-        # Pit Stop
+        # Pit Timer
         if t_start and current_time >= t_start:
             if t_end and current_time >= t_end:
                 val_pit = t_end - t_start
@@ -299,7 +270,7 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         else:
             val_pit, col_pit = 0.0, (200,200,200)
 
-        # Tires
+        # Tire Timer
         if t_up and current_time >= t_up:
             if t_down and current_time >= t_down:
                 val_tire = t_down - t_up
@@ -310,34 +281,30 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         else:
             val_tire, col_tire = 0.0, (200,200,200)
             
-        # Fuel
+        # Fuel Timer
         if t_f_start and current_time >= t_f_start:
             if t_f_end and current_time >= t_f_end:
                 val_fuel = t_f_end - t_f_start
                 col_fuel = (0,0,255)
             else:
                 val_fuel = current_time - t_f_start
-                col_fuel = (255,165,0) # Orange for Fuel
+                col_fuel = (255,165,0)
         else:
             val_fuel, col_fuel = 0.0, (200,200,200)
         
-        # --- DRAW UI ---
-        # Expanded box for 3rd timer
+        # Draw UI
         cv2.rectangle(frame, (width-450, 0), (width, 240), (0,0,0), -1)
         
-        # Pit
         cv2.putText(frame, "PIT STOP", (width-430, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_pit:.2f}s", (width-180, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_pit, 3)
         
-        # Fuel (Middle)
         cv2.putText(frame, "FUELING", (width-430, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_fuel:.2f}s", (width-180, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_fuel, 3)
 
-        # Tires (Bottom)
         cv2.putText(frame, "TIRES", (width-430, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
 
-        cv2.putText(frame, "V24: Fuel Matching", (width-430, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        cv2.putText(frame, "V25: Full Suite (Pit/Fuel/Tires)", (width-430, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -350,14 +317,13 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V24")
-    st.markdown("### Fueling Detection Added")
-    st.info("Includes Fuel Timer based on **Visual Matching** of 'Probe In' reference images.")
+    st.title("🏁 Pit Stop Analyzer V25")
+    st.markdown("### Full Analysis Suite")
+    st.info("Tracks Pit Stop (Motion), Tires (Zoom/Drop), and Fuel (Visual Matching).")
 
-    # Check for refs
     probe_path = os.path.join(BASE_DIR, "refs", "probein")
     if not os.path.exists(probe_path):
-        st.warning("⚠️ 'refs/probein' folder not found. Fuel detection will likely fail.")
+        st.warning("⚠️ 'refs/probein' not found. Fuel detection will fail.")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -372,23 +338,21 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (Motion, Zoom, Fuel Features)...")
+            st.write("Step 1: Extraction...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Logic Analysis...")
             pit_t, tire_t, fuel_t = analyze_states(df, fps)
-            timings = (pit_t, tire_t, fuel_t)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
-                c = alt.Chart(df).mark_line().encode(x='Time', y='Flow_X')
-                st.altair_chart(c, use_container_width=True)
             else:
                 st.write("Step 3: Rendering Video...")
-                vid_path = render_overlay(tfile.name, timings, fps, w, h, bar.progress)
+                # CORRECTED CALL: Passing tuples separately
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, fps, w, h, bar.progress)
                 
                 st.session_state.update({
-                    'df': df, 'video_path': vid_path, 'timings': timings, 'analysis_done': True
+                    'df': df, 'video_path': vid_path, 'timings': (pit_t, tire_t, fuel_t), 'analysis_done': True
                 })
             bar.empty()
         except Exception as e:
@@ -416,15 +380,8 @@ def main():
         st.subheader("📊 Telemetry")
         base = alt.Chart(df).encode(x='Time')
         
-        # Fuel Matches
-        fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(
-            y=alt.Y('Fuel_Smooth', title='Fuel Probe Matches')
-        )
-        
-        # Zoom
-        zoom_chart = base.mark_line(color='magenta').encode(
-            y=alt.Y('Zoom_Smooth', title='Zoom (Tires)')
-        )
+        fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(y=alt.Y('Fuel_Smooth', title='Fuel Matches'))
+        zoom_chart = base.mark_line(color='magenta').encode(y=alt.Y('Zoom_Smooth', title='Zoom'))
         
         st.altair_chart((fuel_chart + zoom_chart).interactive(), use_container_width=True)
         
