@@ -85,8 +85,8 @@ def extract_kinetic_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis (Displacement Logic) ---
-def analyze_states_derivative(df, fps):
+# --- PASS 2: Analysis (Tuned Logic) ---
+def analyze_states_tuned(df, fps):
     # Smooth data
     window_slow = 15
     window_fast = 5
@@ -98,7 +98,7 @@ def analyze_states_derivative(df, fps):
         df['X_Smooth'] = df['Flow_X']
         df['Zoom_Smooth'] = df['Zoom_Score']
 
-    # Zoom Velocity (Derivative)
+    # Zoom Velocity
     df['Zoom_Velocity'] = np.gradient(df['Zoom_Smooth'])
 
     # --- 1. PIT STOP (Horizontal) ---
@@ -128,7 +128,7 @@ def analyze_states_derivative(df, fps):
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
     
-    # --- 2. JACKS (Displacement Verified Drop) ---
+    # --- 2. JACKS (Tuned Thresholds) ---
     t_up, t_down = None, None
     
     if t_start and t_end:
@@ -153,36 +153,25 @@ def analyze_states_derivative(df, fps):
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
                 t_up = times[peaks_up[0]]
-                # Calculate Lift Magnitude (How high did it go?)
-                # We compare max extension to baseline
                 base_zoom = np.min(z_pos)
                 max_zoom = np.max(z_pos)
                 lift_amplitude = max_zoom - base_zoom
             else:
                 t_up = t_start
-                lift_amplitude = 0.5 # Default assumption
+                lift_amplitude = 0.5 
                 
-            # B. FIND DROP (Significant Displacement)
-            # We look for negative velocity spikes
+            # B. FIND DROP (20% Displacement Threshold)
             neg_vel = -z_vel
-            # Find velocity spikes (candidates)
-            # Height=0.1 ensures we ignore tiny noise
+            # Look for velocity spikes > 0.1 (detectable movement)
             cand_drops, _ = find_peaks(neg_vel, height=0.1, distance=fps*0.5)
             
             valid_drops = []
             
             for p in cand_drops:
                 t_p = times[p]
-                
-                # Must be after lift
                 if t_p <= t_up + 1.0: continue
                 
-                # --- DISPLACEMENT CHECK ---
-                # Verify this is a real drop, not a vibration.
-                # A vibration moves down then up (Net change ~ 0).
-                # A drop moves down and stays down (Net change ~ Lift Amplitude).
-                
-                # Look at zoom position 0.5s before and 0.5s after
+                # Compare positions before/after spike
                 idx_before = max(0, p - int(fps*0.3))
                 idx_after = min(len(z_pos)-1, p + int(fps*0.3))
                 
@@ -191,13 +180,12 @@ def analyze_states_derivative(df, fps):
                 
                 drop_distance = pos_before - pos_after
                 
-                # THRESHOLD: The drop must descend at least 50% of the total lift height
-                # This is the "Significant Movement" filter.
-                if drop_distance > (lift_amplitude * 0.4):
+                # THRESHOLD: 20% of Lift Amplitude
+                # Enough to ignore vibration, sensitive enough to catch settling
+                if drop_distance > (lift_amplitude * 0.2):
                     valid_drops.append(t_p)
             
             if valid_drops:
-                # Pick the last one (usually the drop happens right before exit)
                 t_down = valid_drops[-1]
             else:
                 t_down = t_creep_limit
@@ -251,7 +239,7 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
         cv2.putText(frame, "TIRES (Jacks)", (width-430, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
 
-        cv2.putText(frame, "Logic: Drop Displacement Check", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        cv2.putText(frame, "Logic: 20% Displacement Threshold", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -264,9 +252,9 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V21")
-    st.markdown("### Displacement-Gated Drop")
-    st.info("Ignores wing shakes. Drop must result in a net downward movement of at least 40% of the lift height.")
+    st.title("🏁 Pit Stop Analyzer V22")
+    st.markdown("### Tuned Sensitivity")
+    st.info("Drop detection threshold set to **20%** of lift height. Balances vibration filtering with accurate drop detection.")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -285,7 +273,7 @@ def main():
             df, fps, w, h = extract_kinetic_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analyzing Displacement Logic...")
-            t_start, t_end, (t_up, t_down) = analyze_states_derivative(df, fps)
+            t_start, t_end, (t_up, t_down) = analyze_states_tuned(df, fps)
             timings = (t_start, t_end, t_up, t_down)
             
             if t_start is None:
@@ -319,11 +307,9 @@ def main():
         st.subheader("📊 Zoom Telemetry")
         base = alt.Chart(df).encode(x='Time')
         
-        # Zoom Velocity
         zvel = base.mark_line(color='magenta').encode(
             y=alt.Y('Zoom_Velocity', title='Zoom Vel')
         )
-        # Zoom Position
         zpos = base.mark_area(color='gray', opacity=0.3).encode(
             y=alt.Y('Zoom_Smooth', title='Zoom Pos')
         )
