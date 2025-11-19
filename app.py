@@ -56,7 +56,11 @@ def extract_telemetry(video_path, ref_img_path, progress_callback):
     
     telemetry_data = []
     prev_gray = None
-    detection_limit_y = int(height * 0.70) 
+    
+    # --- ZONE CONFIGURATION ---
+    # EXPANDED AREA: Only ignore the very bottom 10% of the screen
+    # This ensures we catch the car even if it occupies the lower half.
+    detection_limit_y = int(height * 0.90) 
     
     frame_idx = 0
     
@@ -76,12 +80,14 @@ def extract_telemetry(video_path, ref_img_path, progress_callback):
         prev_gray = gray_blur
         
         # 2. AI Detection (Primary Metric)
+        # conf=0.15 allows low-confidence detections (good for fisheye/distortion)
         results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
         car_detected = False
         cx, cy = np.nan, np.nan
         
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
+            # Filter: Ignore only if center is in the bottom 10%
             valid_indices = [i for i, box in enumerate(boxes) if box[1] < detection_limit_y]
             if valid_indices:
                 valid_boxes = boxes[valid_indices]
@@ -101,8 +107,6 @@ def extract_telemetry(video_path, ref_img_path, progress_callback):
                     cy = mean_y
                     car_detected = True
         
-        # Note: We record RAW coordinates. Velocity is calculated in post-processing
-        # to allow for gap filling/interpolation.
         telemetry_data.append({
             "Frame": frame_idx,
             "Time": frame_idx / fps,
@@ -128,61 +132,51 @@ def analyze_timings_robust(df, fps):
     """
     
     # --- PRE-PROCESSING: Interpolation ---
-    # If car is lost for < 1 second (30 frames), interpolate the position
-    # This fixes the "Crew covered the car" issue.
+    # Interpolate up to 1.5 seconds of missing data (crew covering car)
     df['Car_X'] = df['Car_X'].interpolate(method='linear', limit=int(fps*1.5))
     df['Car_Y'] = df['Car_Y'].interpolate(method='linear', limit=int(fps*1.5))
     
-    # Calculate Velocity from smooth coordinates
-    # Use Savgol to get smooth derivatives
+    # Calculate Velocity
     window = 15
     if len(df) > window:
-        # Fill remaining NaNs (start/end) with nearest
         df['Car_X'] = df['Car_X'].fillna(method='bfill').fillna(method='ffill')
         df['Car_Y'] = df['Car_Y'].fillna(method='bfill').fillna(method='ffill')
         
-        # Calculate smooth velocity
+        # 1st Derivative (Velocity)
         df['Vel_X'] = savgol_filter(df['Car_X'], window, 3, deriv=1)
         df['Vel_Y'] = savgol_filter(df['Car_Y'], window, 3, deriv=1)
         
-        # Take absolute value
         df['Vel_X'] = df['Vel_X'].abs()
         df['Vel_Y'] = df['Vel_Y'].abs()
     else:
-        # Fallback for tiny videos
         df['Vel_X'] = 0
         df['Vel_Y'] = 0
 
     # --- LAYER 1: Horizontal Stop Detection ---
     t_start, t_end = None, None
     
-    # Threshold: 1.5 pixels per frame is a good "Stop" limit for smoothed data
+    # Stop Threshold
     stop_thresh = 1.5 
     is_stopped = df['Vel_X'] < stop_thresh
     
-    # Clean up the boolean mask (remove tiny glitches)
-    # We look for blocks of 'True' (Stopped)
     df['block'] = (is_stopped != is_stopped.shift()).cumsum()
     blocks = df[is_stopped].groupby('block')
     
     if len(blocks) > 0:
-        # Find largest block
         largest_block = blocks.size().idxmax()
         block_data = df[df['block'] == largest_block]
         duration = block_data.iloc[-1]['Time'] - block_data.iloc[0]['Time']
         
-        # Valid pit stop must be > 2 seconds
+        # Valid pit stop > 2.0 seconds
         if duration > 2.0:
             t_start = block_data.iloc[0]['Time']
             t_end = block_data.iloc[-1]['Time']
 
-    # --- LAYER 2: Fallback to Motion Valley if Layer 1 failed ---
+    # --- LAYER 2: Fallback ---
     used_fallback = False
     if t_start is None:
         used_fallback = True
-        # Use Global Motion Intensity
         df['Motion_Smooth'] = savgol_filter(df['Motion_Intensity'], 25, 3)
-        # High thresholds because arrival/departure are violent events
         max_mot = df['Motion_Smooth'].max()
         high_thresh = max_mot * 0.25
         low_thresh = max_mot * 0.10
@@ -191,41 +185,31 @@ def analyze_timings_robust(df, fps):
         
         if len(peaks) >= 2:
             start_idx = peaks[0]
-            # Walk forward to find where motion drops
             while start_idx < len(df)-1 and df['Motion_Smooth'].iloc[start_idx] > low_thresh:
                 start_idx += 1
             
             end_idx = peaks[-1]
-            # Walk backward to find where motion rises
             while end_idx > 0 and df['Motion_Smooth'].iloc[end_idx] > low_thresh:
                 end_idx -= 1
                 
             t_start = df.iloc[start_idx]['Time']
             t_end = df.iloc[end_idx]['Time']
 
-    # --- DETECT JACKS (Vertical Movement) ---
+    # --- DETECT JACKS ---
     t_up, t_down = None, None
     
     if t_start and t_end:
-        # Look strictly inside the stop window
         window_df = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         
         if not window_df.empty:
-            # If we tracked Y velocity, use it
             y_signal = window_df['Vel_Y'].values
-            
-            # If fallback was used (meaning tracking failed), use raw Motion Intensity
-            # because if tracking failed X, it likely failed Y too.
             if used_fallback:
                 y_signal = window_df['Motion_Intensity'].values
             
-            # Find peaks
-            # Prominence is key here. Jacks are sharp spikes.
             prominence = np.max(y_signal) * 0.2
             peaks, _ = find_peaks(y_signal, prominence=prominence, distance=fps*0.5)
             
             peak_times = window_df.iloc[peaks]['Time'].values
-            
             if len(peak_times) > 0:
                 t_up = peak_times[0]
                 t_down = peak_times[-1] if len(peak_times) > 1 else t_end
@@ -242,6 +226,8 @@ def render_final_video(input_path, timings, fps, width, height, progress_callbac
     
     frame_idx = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    detection_limit_y = int(height * 0.90) # Update visual line to 90%
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -282,7 +268,9 @@ def render_final_video(input_path, timings, fps, width, height, progress_callbac
         cv2.putText(frame, "TIRES (V-Jolt)", (width - 380, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color_tire, 3)
         
-        cv2.line(frame, (0, int(height*0.7)), (width, int(height*0.7)), (0,0,100), 1)
+        # Draw New Limit Line
+        cv2.line(frame, (0, detection_limit_y), (width, detection_limit_y), (0,0,100), 1)
+        cv2.putText(frame, "Limit (10%)", (10, detection_limit_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,100), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -295,9 +283,9 @@ def render_final_video(input_path, timings, fps, width, height, progress_callbac
 
 # --- Main UI ---
 def main():
-    st.title("🏁 Pit Stop AI Analyzer V10")
-    st.markdown("### Robust Dual-Layer Detection")
-    st.info("Uses Horizontal Velocity (interpolated) primarily. Falls back to Motion Intensity if car detection fails.")
+    st.title("🏁 Pit Stop AI Analyzer V11")
+    st.markdown("### Robust Detection (Wide Area)")
+    st.info("Expanded monitoring to 90% of the screen height to ensure car is detected.")
 
     default_ref_path = os.path.join(BASE_DIR, "refs", "car.png")
     ref_path = default_ref_path if os.path.exists(default_ref_path) else None
@@ -318,7 +306,7 @@ def main():
             progress_bar = st.progress(0)
             status = st.empty()
             
-            status.write("Pass 1/2: Extracting Telemetry...")
+            status.write("Pass 1/2: Extracting Telemetry (Wide Scan)...")
             df, fps, w, h = extract_telemetry(tfile_in.name, ref_path, progress_bar.progress)
             
             status.write("Calculating Events...")
@@ -326,10 +314,7 @@ def main():
             timings = (t_start, t_end, t_up, t_down)
             
             if t_start is None:
-                st.error("Critical Failure: Could not identify any stop event (Motion or Velocity).")
-                # Debug Chart
-                c = alt.Chart(df).mark_line().encode(x='Time', y='Motion_Intensity')
-                st.altair_chart(c, use_container_width=True)
+                st.error("Critical Failure: Could not identify any stop event.")
             else:
                 status.write("Pass 2/2: Rendering Overlay Video...")
                 vid_path = render_final_video(tfile_in.name, timings, fps, w, h, progress_bar.progress)
@@ -359,7 +344,7 @@ def main():
         st.divider()
         
         if fallback:
-            st.warning("⚠️ Detection Warning: Horizontal Velocity tracking failed (Car not detected reliably). Fell back to Motion Intensity analysis.")
+            st.warning("⚠️ Note: Used Motion Intensity backup. (Check video to confirm).")
         
         m1, m2, m3, m4 = st.columns(4)
         if t_start and t_end:
@@ -381,7 +366,6 @@ def main():
         
         # Velocity Y / Motion
         if fallback:
-            # Show Motion Intensity if fallback used
             l2 = base.mark_area(color='gray', opacity=0.3).encode(y=alt.Y('Motion_Intensity', title='Global Motion (Fallback)'))
         else:
             l2 = base.mark_line(color='orange').encode(y=alt.Y('Vel_Y', title='Vertical Vel'))
