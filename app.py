@@ -38,8 +38,7 @@ def match_features(frame_gray, ref_des, orb_detector):
 # --- PASS 1: Data Extraction ---
 def extract_telemetry(video_path, ref_img_path, progress_callback):
     """
-    Pass 1: Analyze video to get Motion and Object Detection data.
-    Does NOT generate the output video yet.
+    Pass 1: Extract X and Y coordinates of the car specifically.
     """
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -59,12 +58,12 @@ def extract_telemetry(video_path, ref_img_path, progress_callback):
             _, ref_des = get_ref_features(ref_img)
     
     telemetry_data = []
-    prev_gray = None
     
-    # Zones
-    stall_x_start = int(width * 0.20) 
-    stall_x_end = int(width * 0.80)
-    detection_limit_y = int(height * 0.70)
+    # Tracking state
+    prev_x, prev_y = None, None
+    
+    # Filter settings
+    detection_limit_y = int(height * 0.70) # Ignore bottom 30%
     
     frame_idx = 0
     
@@ -74,20 +73,11 @@ def extract_telemetry(video_path, ref_img_path, progress_callback):
             break
             
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
         
-        # Motion
-        motion_score = 0.0
-        if prev_gray is not None:
-            delta = cv2.absdiff(prev_gray, gray_blur)
-            thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)[1]
-            motion_score = np.sum(thresh) / 255.0
-        prev_gray = gray_blur
-
         # AI Detection
         results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
         car_detected = False
-        car_center_x = -1
+        cx, cy = np.nan, np.nan
         
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
@@ -98,30 +88,43 @@ def extract_telemetry(video_path, ref_img_path, progress_callback):
                 areas = valid_boxes[:, 2] * valid_boxes[:, 3]
                 largest_idx = np.argmax(areas)
                 bx, by, bw, bh = valid_boxes[largest_idx]
-                car_center_x = bx
+                cx, cy = bx, by
                 car_detected = True
 
-        # Ref Match
-        ref_match_detected = False
+        # Ref Match Fallback
         if not car_detected and ref_des is not None:
             match_found, points = match_features(gray, ref_des, orb)
             if match_found:
                 mean_y = np.mean(points[:, 0, 1])
                 if mean_y < detection_limit_y:
-                    ref_match_detected = True
-                    car_center_x = np.mean(points[:, 0, 0])
+                    cx = np.mean(points[:, 0, 0])
+                    cy = mean_y
+                    car_detected = True
         
-        # Stall Logic
-        in_stall = False
-        if car_detected or ref_match_detected:
-            if stall_x_start < car_center_x < stall_x_end:
-                in_stall = True
+        # Calculate Instantaneous Velocity (Pixels/Frame)
+        vel_x = 0.0
+        vel_y = 0.0
+        
+        if car_detected:
+            if prev_x is not None:
+                vel_x = abs(cx - prev_x)
+                vel_y = abs(cy - prev_y)
+            prev_x, prev_y = cx, cy
+        else:
+            # If car is lost (occluded), we assume it is stationary for calculation purposes
+            # OR we leave as NaN and interpolate later. 
+            # Given crew swarm, assuming 0 during occlusion is safer for "Stop" logic.
+            vel_x = 0.0
+            vel_y = 0.0
+            # We do NOT update prev_x/y so that when it reappears we don't get a massive jump spike
 
         telemetry_data.append({
             "Frame": frame_idx,
             "Time": frame_idx / fps,
-            "Motion_Intensity": motion_score,
-            "In_Stall": in_stall
+            "Vel_X": vel_x,
+            "Vel_Y": vel_y,
+            "Car_X": cx,
+            "Car_Y": cy
         })
 
         frame_idx += 1
@@ -132,125 +135,152 @@ def extract_telemetry(video_path, ref_img_path, progress_callback):
     return pd.DataFrame(telemetry_data), fps, width, height
 
 # --- Timing Analysis ---
-def analyze_timings_valley(df, fps):
-    """Calculate Start/End times based on motion valley."""
-    df['Motion_Smooth'] = savgol_filter(df['Motion_Intensity'], 15, 3)
-    max_motion = df['Motion_Smooth'].max()
-    threshold_high = max_motion * 0.25
-    threshold_low = max_motion * 0.10
+def analyze_timings_xy(df, fps):
+    """
+    Determines events based on X and Y velocity separation.
+    Pit Stop = Horizontal (X) Stop.
+    Jacks = Vertical (Y) Movement while X is stopped.
+    """
+    # 1. Smooth Velocities
+    # Fill NaNs (occlusions) with 0
+    df['Vel_X'] = df['Vel_X'].fillna(0)
+    df['Vel_Y'] = df['Vel_Y'].fillna(0)
     
-    peaks, _ = find_peaks(df['Motion_Smooth'], height=threshold_high, distance=fps*5)
+    # Savgol filter for smoothing
+    window = 15 # frames
+    df['Vel_X_Smooth'] = savgol_filter(df['Vel_X'], window, 3)
+    df['Vel_Y_Smooth'] = savgol_filter(df['Vel_Y'], window, 3)
+    
+    # 2. Find Pit Stop (Horizontal Stop)
+    # Threshold: How many pixels/frame count as "Moving Horizontally"?
+    # Fisheye lens: movement is small in center. 
+    # We look for the transition from High X Speed -> Low X Speed
+    
+    move_thresh_x = 1.0 # Pixels per frame
+    
+    # We create a boolean mask: Is the car moving horizontally?
+    is_moving_x = df['Vel_X_Smooth'] > move_thresh_x
+    
+    # We look for a long pause in movement
+    # Invert mask: Is Stopped?
+    is_stopped_x = ~is_moving_x
+    
+    # Find contiguous blocks of "Stopped"
+    # We only care about blocks in the middle of the video (ignore start/end buffers)
+    # Heuristic: Pit stop is usually the longest stopped block
+    
+    df['block'] = (is_stopped_x != is_stopped_x.shift()).cumsum()
+    blocks = df[is_stopped_x].groupby('block')
+    
     t_start, t_end = None, None
     
-    if len(peaks) >= 2:
-        arrival_idx = peaks[0]
-        departure_idx = peaks[-1]
+    if len(blocks) > 0:
+        # Get longest stopped block
+        largest_block_idx = blocks.size().idxmax()
+        block_data = df[df['block'] == largest_block_idx]
         
-        start_idx = arrival_idx
-        for i in range(arrival_idx, len(df)):
-            if df['Motion_Smooth'].iloc[i] < threshold_low:
-                start_idx = i
-                break
-        
-        end_idx = departure_idx
-        for i in range(departure_idx, start_idx, -1):
-            if df['Motion_Smooth'].iloc[i] < threshold_low:
-                end_idx = i
-                break
-        
-        t_start = df.iloc[start_idx]['Time']
-        t_end = df.iloc[end_idx]['Time']
-    else:
-        # Fallback
-        mid_df = df.iloc[int(len(df)*0.1):int(len(df)*0.9)]
-        mask = mid_df['Motion_Smooth'] < threshold_low
-        mid_df = mid_df.copy()
-        mid_df['block'] = (mask != mask.shift()).cumsum()
-        blocks = mid_df[mask].groupby('block')
-        if len(blocks) > 0:
-            largest = blocks.size().idxmax()
-            segment = mid_df[mid_df['block'] == largest]
-            t_start = segment['Time'].min()
-            t_end = segment['Time'].max()
+        # Filter outliers: A pit stop must be at least 2 seconds
+        if (block_data.iloc[-1]['Time'] - block_data.iloc[0]['Time']) > 2.0:
+            t_start = block_data.iloc[0]['Time']
+            t_end = block_data.iloc[-1]['Time']
 
-    # Tire Change
-    t_up, t_down = t_start, t_end
+    # 3. Find Jacks (Vertical Movement)
+    # We search strictly INSIDE the Horizontal Stop Window
+    t_up, t_down = None, None
+    
     if t_start and t_end:
-        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
+        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)].copy()
+        
         if not stop_window.empty:
-            curve = stop_window['Motion_Intensity'].values
-            j_peaks, _ = find_peaks(curve, prominence=np.max(curve)*0.15)
-            if len(j_peaks) > 0:
-                times = stop_window.iloc[j_peaks]['Time'].values
-                t_up = times[0]
-                t_down = times[-1]
+            # We look for spikes in Y Velocity (Vertical Movement)
+            # The car is "Stopped" horizontally, so any Y movement is likely Jacks
+            
+            y_curve = stop_window['Vel_Y_Smooth'].values
+            
+            # Peak detection on Y velocity
+            # Prominence needs to be tuned. 
+            # Jacks are sudden jolts.
+            peaks, _ = find_peaks(y_curve, height=0.5, distance=fps*1) # Min 0.5px movement, 1s apart
+            
+            peak_times = stop_window.iloc[peaks]['Time'].values
+            
+            if len(peak_times) >= 1:
+                t_up = peak_times[0] # First vertical jolt = Up
+                
+                if len(peak_times) >= 2:
+                    t_down = peak_times[-1] # Last vertical jolt = Down
+                else:
+                    # If only one spike detected? 
+                    # Maybe we missed the drop. Assume drop is near departure?
+                    # Let's be conservative: If only 1 spike, maybe it's just Up.
+                    t_down = t_end # Default to departure if drop not detected clearly
+            else:
+                # No vertical movement detected?
+                # Maybe the camera angle makes Y movement invisible.
+                t_up = t_start
+                t_down = t_end
 
     return t_start, t_end, (t_up, t_down)
 
 # --- PASS 2: Video Rendering ---
 def render_final_video(input_path, timings, fps, width, height, progress_callback):
-    """
-    Pass 2: Re-read video and overlay the calculated timers.
-    """
     t_start, t_end, t_up, t_down = timings
-    
     cap = cv2.VideoCapture(input_path)
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
     out = cv2.VideoWriter(temp_output.name, fourcc, fps, (width, height))
-    
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
+    
+    # Fill None with 0 for logic
+    ts = t_start if t_start else 0
+    te = t_end if t_end else 0
+    tu = t_up if t_up else 0
+    td = t_down if t_down else 0
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
-        
         current_time = frame_idx / fps
         
-        # --- CALCULATE TIMERS ---
-        
-        # 1. Pit Stop Timer
+        # 1. Pit Stop Timer (Horizontal Stop)
+        # Runs from t_start until t_end
         if t_start and current_time >= t_start:
             if t_end and current_time >= t_end:
                 val_pit = t_end - t_start
-                color_pit = (0, 0, 255) # Red (Stopped)
+                color_pit = (0, 0, 255) # Red (Done)
             else:
                 val_pit = current_time - t_start
                 color_pit = (0, 255, 0) # Green (Running)
         else:
             val_pit = 0.0
-            color_pit = (200, 200, 200) # Gray (Waiting)
+            color_pit = (200, 200, 200) 
 
-        # 2. Tire Change Timer
+        # 2. Tire Change Timer (Vertical Jolt)
+        # Runs from t_up until t_down
         if t_up and current_time >= t_up:
             if t_down and current_time >= t_down:
                 val_tire = t_down - t_up
                 color_tire = (0, 0, 255)
             else:
                 val_tire = current_time - t_up
-                color_tire = (0, 255, 255) # Yellow (Running)
+                color_tire = (0, 255, 255)
         else:
             val_tire = 0.0
             color_tire = (200, 200, 200)
 
-        # --- DRAW OVERLAY ---
-        
-        # Background Box (Top Right)
-        box_w, box_h = 350, 130
+        # Draw Overlay
+        box_w, box_h = 400, 140
         cv2.rectangle(frame, (width - box_w, 0), (width, box_h), (0, 0, 0), -1)
         
-        # Draw Pit Stop
-        cv2.putText(frame, "PIT STOP", (width - 330, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(frame, f"{val_pit:.2f}s", (width - 160, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color_pit, 3)
+        cv2.putText(frame, "PIT STOP (H-Stop)", (width - 380, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"{val_pit:.2f}s", (width - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color_pit, 3)
 
-        # Draw Tires
-        cv2.putText(frame, "TIRES", (width - 330, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(frame, f"{val_tire:.2f}s", (width - 160, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color_tire, 3)
-
-        # Exclusion Line (Visual Reference)
-        detection_limit_y = int(height * 0.70)
-        cv2.line(frame, (0, detection_limit_y), (width, detection_limit_y), (0, 0, 100), 1)
+        cv2.putText(frame, "TIRES (V-Jolt)", (width - 380, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"{val_tire:.2f}s", (width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color_tire, 3)
+        
+        # Draw Detection Line
+        cv2.line(frame, (0, int(height*0.7)), (width, int(height*0.7)), (0,0,100), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -263,16 +293,16 @@ def render_final_video(input_path, timings, fps, width, height, progress_callbac
 
 # --- Main UI ---
 def main():
-    st.title("🏁 Pit Stop AI Analyzer V7")
-    st.markdown("### Automated Timing & Overlay")
-    st.info("Two-pass analysis: 1. Detect Motion/Events -> 2. Generate Video with synchronized timers.")
+    st.title("🏁 Pit Stop AI Analyzer V8")
+    st.markdown("### X/Y Velocity Logic")
+    st.info("""
+    **Pit Stop Timer:** Starts when Horizontal Velocity (X) drops to zero.
+    **Tire Change Timer:** Starts/Stops on Vertical Velocity (Y) spikes (Jacks) while car is stopped.
+    """)
 
-    # Ref Image
     default_ref_path = os.path.join(BASE_DIR, "refs", "car.png")
     ref_path = default_ref_path if os.path.exists(default_ref_path) else None
-    if not ref_path: st.warning("Reference image not found. Using AI only.")
 
-    # Session
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
 
@@ -289,19 +319,16 @@ def main():
             progress_bar = st.progress(0)
             status = st.empty()
             
-            # PASS 1
-            status.write("Pass 1/2: Analyzing Motion & Detections...")
+            status.write("Pass 1/2: Tracking X/Y Velocity...")
             df, fps, w, h = extract_telemetry(tfile_in.name, ref_path, progress_bar.progress)
             
-            # CALCULATION
-            status.write("Calculating Timings...")
-            t_start, t_end, (t_up, t_down) = analyze_timings_valley(df, fps)
+            status.write("Calculating Events based on Vectors...")
+            t_start, t_end, (t_up, t_down) = analyze_timings_xy(df, fps)
             timings = (t_start, t_end, t_up, t_down)
             
             if t_start is None:
-                st.error("Could not identify pit stop window.")
+                st.error("Could not detect a horizontal stop.")
             else:
-                # PASS 2
                 status.write("Pass 2/2: Rendering Overlay Video...")
                 vid_path = render_final_video(tfile_in.name, timings, fps, w, h, progress_bar.progress)
                 
@@ -327,19 +354,38 @@ def main():
 
         st.divider()
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Pit Stop Duration", f"{(t_end - t_start):.2f}s")
-        m2.metric("Tire Change", f"{(t_down - t_up):.2f}s")
-        m3.metric("Stop Time", f"{t_start:.2f}s")
-        m4.metric("Go Time", f"{t_end:.2f}s")
+        if t_start and t_end:
+            m1.metric("Pit Stop Duration", f"{(t_end - t_start):.2f}s")
+            m3.metric("Stop Time (H-Stop)", f"{t_start:.2f}s")
+            m4.metric("Go Time (H-Start)", f"{t_end:.2f}s")
+        
+        if t_up and t_down:
+            m2.metric("Tire Change", f"{(t_down - t_up):.2f}s")
+        else:
+            m2.metric("Tire Change", "--")
 
-        st.subheader("📊 Motion Telemetry")
+        st.subheader("📊 Velocity Telemetry")
+        
         base = alt.Chart(df).encode(x='Time')
-        area = base.mark_area(color='gray', opacity=0.3).encode(y=alt.Y('Motion_Intensity'))
-        line = base.mark_line(color='blue', opacity=0.5).encode(y='Motion_Smooth')
-        stop_rect = alt.Chart(pd.DataFrame({'start': [t_start], 'end': [t_end]})).mark_rect(color='green', opacity=0.1).encode(x='start', x2='end')
-        rules = pd.DataFrame([{"Time": t_start, "Event": "Start", "Color": "green"}, {"Time": t_end, "Event": "End", "Color": "red"}])
-        rule_chart = alt.Chart(rules).mark_rule(strokeWidth=3).encode(x='Time', color=alt.Color('Color', scale=None))
-        st.altair_chart((area + line + stop_rect + rule_chart).interactive(), use_container_width=True)
+        
+        # Plot X Velocity (Horizontal)
+        line_x = base.mark_line(color='cyan').encode(
+            y=alt.Y('Vel_X_Smooth', title='Horizontal Speed (X)'),
+            tooltip=['Time', 'Vel_X_Smooth']
+        )
+        
+        # Plot Y Velocity (Vertical/Jacks)
+        line_y = base.mark_line(color='orange').encode(
+            y=alt.Y('Vel_Y_Smooth', title='Vertical Speed (Y)'),
+            tooltip=['Time', 'Vel_Y_Smooth']
+        )
+        
+        # Highlight Stop Window
+        if t_start and t_end:
+            rect = alt.Chart(pd.DataFrame({'s': [t_start], 'e': [t_end]})).mark_rect(color='green', opacity=0.1).encode(x='s', x2='e')
+            st.altair_chart((line_x + line_y + rect).interactive(), use_container_width=True)
+        else:
+            st.altair_chart((line_x + line_y).interactive(), use_container_width=True)
         
         st.subheader("👁️ Final Video")
         c1, c2 = st.columns([3,1])
