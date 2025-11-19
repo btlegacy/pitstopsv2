@@ -85,8 +85,8 @@ def extract_kinetic_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis (Tuned Logic) ---
-def analyze_states_tuned(df, fps):
+# --- PASS 2: Analysis (Max Velocity Logic) ---
+def analyze_states_max_vel(df, fps):
     # Smooth data
     window_slow = 15
     window_fast = 5
@@ -98,7 +98,7 @@ def analyze_states_tuned(df, fps):
         df['X_Smooth'] = df['Flow_X']
         df['Zoom_Smooth'] = df['Zoom_Score']
 
-    # Zoom Velocity
+    # Zoom Velocity (Derivative)
     df['Zoom_Velocity'] = np.gradient(df['Zoom_Smooth'])
 
     # --- 1. PIT STOP (Horizontal) ---
@@ -128,67 +128,50 @@ def analyze_states_tuned(df, fps):
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
     
-    # --- 2. JACKS (Tuned Thresholds) ---
+    # --- 2. JACKS (Global Min Velocity) ---
     t_up, t_down = None, None
     
     if t_start and t_end:
-        # Creep Gate
-        creep_idx = end_idx
-        CREEP_THRESH = STOP_THRESH * 0.5
-        for i in range(end_idx, start_idx, -1):
-            if x_mag.iloc[i] < CREEP_THRESH:
-                creep_idx = i
-                break
-        t_creep_limit = df.iloc[creep_idx]['Time']
+        # Creep Gate: Stop looking 1.0s before the car starts moving horizontally
+        # This prevents departure artifacts from being seen as "Drops"
+        t_creep_limit = t_end - 1.0
         
-        # Window
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep_limit)]
         
         if not stop_window.empty:
-            z_vel = stop_window['Zoom_Velocity'].values
             z_pos = stop_window['Zoom_Smooth'].values
             times = stop_window['Time'].values
             
-            # A. FIND LIFT
+            # A. FIND LIFT (First Expansion)
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
                 t_up = times[peaks_up[0]]
-                base_zoom = np.min(z_pos)
-                max_zoom = np.max(z_pos)
-                lift_amplitude = max_zoom - base_zoom
             else:
                 t_up = t_start
-                lift_amplitude = 0.5 
                 
-            # B. FIND DROP (20% Displacement Threshold)
-            neg_vel = -z_vel
-            # Look for velocity spikes > 0.1 (detectable movement)
-            cand_drops, _ = find_peaks(neg_vel, height=0.1, distance=fps*0.5)
+            # B. FIND DROP (Max Contraction Velocity)
+            # Look strictly AFTER the lift
             
-            valid_drops = []
+            # Create a sub-window for the Drop Search
+            drop_search_mask = (stop_window['Time'] > t_up + 1.0) 
             
-            for p in cand_drops:
-                t_p = times[p]
-                if t_p <= t_up + 1.0: continue
+            if np.any(drop_search_mask):
+                drop_window = stop_window[drop_search_mask]
+                z_vel_drop = drop_window['Zoom_Velocity'].values
+                times_drop = drop_window['Time'].values
                 
-                # Compare positions before/after spike
-                idx_before = max(0, p - int(fps*0.3))
-                idx_after = min(len(z_pos)-1, p + int(fps*0.3))
+                # Find the single most violent contraction event
+                # Ideally, this is the minimum value in the velocity array
+                min_idx = np.argmin(z_vel_drop)
+                min_val = z_vel_drop[min_idx]
                 
-                pos_before = z_pos[idx_before]
-                pos_after = z_pos[idx_after]
-                
-                drop_distance = pos_before - pos_after
-                
-                # THRESHOLD: 20% of Lift Amplitude
-                # Enough to ignore vibration, sensitive enough to catch settling
-                if drop_distance > (lift_amplitude * 0.2):
-                    valid_drops.append(t_p)
-            
-            if valid_drops:
-                t_down = valid_drops[-1]
+                # Safety Check: It must be a "Negative" snap (Contraction)
+                if min_val < -0.05: # Basic noise filter
+                    t_down = times_drop[min_idx]
+                else:
+                    t_down = t_end # No distinct drop found
             else:
-                t_down = t_creep_limit
+                t_down = t_end
 
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
@@ -239,7 +222,7 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
         cv2.putText(frame, "TIRES (Jacks)", (width-430, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
 
-        cv2.putText(frame, "Logic: 20% Displacement Threshold", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        cv2.putText(frame, "Logic: Max Snap Velocity", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -252,9 +235,9 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V22")
-    st.markdown("### Tuned Sensitivity")
-    st.info("Drop detection threshold set to **20%** of lift height. Balances vibration filtering with accurate drop detection.")
+    st.title("🏁 Pit Stop Analyzer V23")
+    st.markdown("### Max Velocity Drop Detection")
+    st.info("Identifies the **Most Violent** contraction event between the Lift and Departure. This ignores small shakes and late drifts.")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -272,8 +255,8 @@ def main():
             st.write("Step 1: Extracting Kinetic & Zoom Metrics...")
             df, fps, w, h = extract_kinetic_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Analyzing Displacement Logic...")
-            t_start, t_end, (t_up, t_down) = analyze_states_tuned(df, fps)
+            st.write("Step 2: Finding Sharpest Drop...")
+            t_start, t_end, (t_up, t_down) = analyze_states_max_vel(df, fps)
             timings = (t_start, t_end, t_up, t_down)
             
             if t_start is None:
@@ -308,7 +291,7 @@ def main():
         base = alt.Chart(df).encode(x='Time')
         
         zvel = base.mark_line(color='magenta').encode(
-            y=alt.Y('Zoom_Velocity', title='Zoom Vel')
+            y=alt.Y('Zoom_Velocity', title='Zoom Vel (Low = Drop)')
         )
         zpos = base.mark_area(color='gray', opacity=0.3).encode(
             y=alt.Y('Zoom_Smooth', title='Zoom Pos')
