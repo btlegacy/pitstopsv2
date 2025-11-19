@@ -11,7 +11,7 @@ from scipy.signal import savgol_filter, find_peaks
 st.set_page_config(page_title="Pit Stop Analytics AI", layout="wide")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# --- PASS 1: Extraction (Kinetic + Zoom + Vertical) ---
+# --- PASS 1: Extraction (Kinetic + Zoom) ---
 def extract_kinetic_telemetry(video_path, progress_callback):
     cap = cv2.VideoCapture(video_path)
     
@@ -23,10 +23,9 @@ def extract_kinetic_telemetry(video_path, progress_callback):
 
     telemetry_data = []
     
-    # ROI: Center Box 
+    # ROI: Focus on the car body (exclude outer pit lane)
     roi_x1, roi_x2 = int(width * 0.25), int(width * 0.75)
     roi_y1, roi_y2 = int(height * 0.25), int(height * 0.75)
-    
     mid_x = int((roi_x2 - roi_x1) / 2)
     
     ret, prev_frame = cap.read()
@@ -47,21 +46,19 @@ def extract_kinetic_telemetry(video_path, progress_callback):
         # Dense Optical Flow
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 
                                             0.5, 3, 15, 3, 5, 1.2, 0)
-        
         fx = flow[..., 0]
         fy = flow[..., 1]
         
-        # 1. GLOBAL MOMENTUM (Horizontal Stop)
+        # 1. HORIZONTAL MOMENTUM (Median X)
         mag = np.sqrt(fx**2 + fy**2)
         active_mask = mag > 1.0 
         if np.any(active_mask):
             med_x = np.median(fx[active_mask])
-            med_y = np.median(fy[active_mask])
         else:
             med_x = 0.0
-            med_y = 0.0
             
-        # 2. ZOOM METRIC (Radial Expansion)
+        # 2. ZOOM METRIC (Wing/Body Expansion)
+        # High contrast features (like the wing text) dominate this signal
         flow_left = fx[:, :mid_x]
         flow_right = fx[:, mid_x:]
         
@@ -71,14 +68,15 @@ def extract_kinetic_telemetry(video_path, progress_callback):
         val_l = np.median(flow_left[mask_l]) if np.any(mask_l) else 0.0
         val_r = np.median(flow_right[mask_r]) if np.any(mask_r) else 0.0
         
-        # Expansion = Positive Zoom
+        # Zoom = (Right - Left). 
+        # Positive = Expansion (Up/Closer)
+        # Negative = Contraction (Down/Away)
         zoom_score = val_r - val_l
 
         telemetry_data.append({
             "Frame": frame_idx,
             "Time": frame_idx / fps,
             "Flow_X": med_x,
-            "Flow_Y": med_y,
             "Zoom_Score": zoom_score
         })
         
@@ -91,20 +89,23 @@ def extract_kinetic_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis ---
-def analyze_states(df, fps):
+# --- PASS 2: Analysis (Derivative Logic) ---
+def analyze_states_derivative(df, fps):
     # Smooth data
-    window_fast = 7
+    # Use smaller window for zoom to catch the sharp "Drop" snap
     window_slow = 15
+    window_fast = 5
     
     if len(df) > window_slow:
         df['X_Smooth'] = savgol_filter(df['Flow_X'], window_slow, 3)
-        df['Y_Smooth'] = savgol_filter(df['Flow_Y'], window_fast, 3) 
         df['Zoom_Smooth'] = savgol_filter(df['Zoom_Score'], window_fast, 3)
     else:
         df['X_Smooth'] = df['Flow_X']
-        df['Y_Smooth'] = df['Flow_Y']
         df['Zoom_Smooth'] = df['Zoom_Score']
+
+    # Calculate Derivative of Zoom (Velocity of Expansion/Contraction)
+    # A Drop is a high-velocity Contraction.
+    df['Zoom_Velocity'] = np.gradient(df['Zoom_Smooth'])
 
     # --- 1. PIT STOP (Horizontal) ---
     x_mag = df['X_Smooth'].abs()
@@ -118,12 +119,14 @@ def analyze_states(df, fps):
         arrival_idx = peaks[0]
         depart_idx = peaks[-1]
         
+        # Precise Stop Start
         start_idx = arrival_idx
         for i in range(arrival_idx, depart_idx):
             if x_mag.iloc[i] < STOP_THRESH:
                 start_idx = i
                 break
         
+        # Precise Stop End
         end_idx = depart_idx
         for i in range(depart_idx, start_idx, -1):
             if x_mag.iloc[i] < STOP_THRESH:
@@ -132,65 +135,76 @@ def analyze_states(df, fps):
         
         t_start = df.iloc[start_idx]['Time']
         t_end = df.iloc[end_idx]['Time']
-
-    # --- 2. JACKS (Signal-to-Noise Drop Detection) ---
+    
+    # --- 2. JACKS (Physics-Based Drop Detection) ---
     t_up, t_down = None, None
     
     if t_start and t_end:
-        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
+        # Define the "Work Window"
+        # Crucial: We stop looking for the drop the moment the car "Creeps"
+        # Find where X-velocity starts rising even slightly (Creep Gate)
+        
+        creep_idx = end_idx
+        CREEP_THRESH = STOP_THRESH * 0.5 # Very sensitive
+        
+        # Walk backward from departure to find absolute stillness
+        for i in range(end_idx, start_idx, -1):
+            if x_mag.iloc[i] < CREEP_THRESH:
+                creep_idx = i
+                break
+        
+        t_creep_limit = df.iloc[creep_idx]['Time']
+        
+        # Search Window: From Stop Start to Creep Limit
+        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep_limit)]
         
         if not stop_window.empty:
-            z_sig = stop_window['Zoom_Smooth'].values
-            y_sig = stop_window['Y_Smooth'].values
+            z_vel = stop_window['Zoom_Velocity'].values
+            z_pos = stop_window['Zoom_Smooth'].values
+            times = stop_window['Time'].values
             
-            # Calculate Noise Floor (Standard Deviation)
-            z_std = np.std(z_sig)
-            y_std = np.std(y_sig)
+            # A. FIND LIFT (Max Positive Zoom Velocity)
+            # The moment the jacks hit, the car shoots up fastest
+            lift_idx = np.argmax(z_pos) # Peak extension
+            # Alternatively, peak positive velocity is the start of lift
             
-            # Thresholds: Must stick out 2x above noise
-            thresh_z = z_std * 2.0
-            thresh_y = y_std * 2.0
-            
-            # A. FIND LIFT (Positive Zoom)
-            # Find peaks
-            peaks_up, _ = find_peaks(z_sig, height=thresh_z, distance=fps)
-            
+            # Let's stick to Peak Extension as "Up" state established
+            # Find peaks in Zoom Position
+            peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
-                t_up = stop_window.iloc[peaks_up[0]]['Time']
+                t_up = times[peaks_up[0]]
             else:
                 t_up = t_start
 
-            # B. FIND DROP (Negative Zoom OR Jolt)
-            # Crucial: Ignore Departure Noise
-            # Valid drops must happen BEFORE the car starts leaving
-            valid_window_end = t_end - 1.5  # Buffer: 1.5s before departure
+            # B. FIND DROP (Max Negative Zoom Velocity)
+            # Gravity makes the drop faster than the lift.
+            # We look for the Minimum Derivative (Steepest Downward Slope)
+            # that occurs AFTER the lift.
             
-            # 1. Contraction Candidates (Negative Peaks)
-            peaks_contract, props_c = find_peaks(-z_sig, height=thresh_z, prominence=thresh_z*0.5, distance=fps)
+            # Filter for times after Lift
+            mask_after_lift = times > (t_up + 1.0) # 1s buffer for stable lift
             
-            # 2. Jolt Candidates (Absolute Y Peaks)
-            peaks_jolt, props_j = find_peaks(np.abs(y_sig), height=thresh_y, prominence=thresh_y*0.5, distance=fps)
-            
-            valid_drops = []
-            
-            # Filter candidates
-            for p in peaks_contract:
-                t = stop_window.iloc[p]['Time']
-                if t > t_up + 1.0 and t < valid_window_end:
-                    valid_drops.append(t)
-            
-            for p in peaks_jolt:
-                t = stop_window.iloc[p]['Time']
-                if t > t_up + 1.0 and t < valid_window_end:
-                    valid_drops.append(t)
-            
-            if valid_drops:
-                # Pick the LAST valid event before departure buffer
-                valid_drops.sort()
-                t_down = valid_drops[-1]
+            if np.any(mask_after_lift):
+                valid_z_vel = z_vel[mask_after_lift]
+                valid_times = times[mask_after_lift]
+                
+                # The Drop is the point of FASTEST contraction (most negative velocity)
+                min_vel_idx = np.argmin(valid_z_vel)
+                min_vel_val = valid_z_vel[min_vel_idx]
+                
+                # Threshold: Is this a real drop or just drift?
+                # It needs to be a sharp snap.
+                if min_vel_val < -0.05: # Tunable threshold for "Snap" intensity
+                    t_down = valid_times[min_vel_idx]
+                else:
+                    # No sharp drop found? Fallback to end of window
+                    t_down = t_creep_limit
             else:
-                # Fallback to end if no distinct drop found
-                t_down = t_end
+                t_down = t_creep_limit
+
+    # Fail-safes
+    if t_up is None: t_up = t_start
+    if t_down is None: t_down = t_end
 
     return t_start, t_end, (t_up, t_down)
 
@@ -238,7 +252,7 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
         cv2.putText(frame, "TIRES (Jacks)", (width-430, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
 
-        cv2.putText(frame, "Logic: Zoom(Up) -> Last Jolt(Down)", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        cv2.putText(frame, "Logic: Max Contraction Velocity", (width-430, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -251,9 +265,9 @@ def render_overlay(input_path, timings, fps, width, height, progress_callback):
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V19")
-    st.markdown("### Buffer-Gated Drop Detection")
-    st.info("Prioritizes drops before the departure event to avoid confusing 'Car Leaving' with 'Jacks Down'.")
+    st.title("🏁 Pit Stop Analyzer V20")
+    st.markdown("### Snap-Drop Logic")
+    st.info("Detects the **Fastest** Contraction (Snap) of the Zoom metric. This catches the moment the wing drops away from the camera.")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -271,8 +285,8 @@ def main():
             st.write("Step 1: Extracting Kinetic & Zoom Metrics...")
             df, fps, w, h = extract_kinetic_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Analyzing Stop/Jacks Logic...")
-            t_start, t_end, (t_up, t_down) = analyze_states(df, fps)
+            st.write("Step 2: Analyzing Velocity Derivatives...")
+            t_start, t_end, (t_up, t_down) = analyze_states_derivative(df, fps)
             timings = (t_start, t_end, t_up, t_down)
             
             if t_start is None:
@@ -303,27 +317,26 @@ def main():
         if t_up and t_down:
             c2.metric("Tire Change Time", f"{t_down - t_up:.2f}s")
         
-        st.subheader("📊 Zoom & Jolt Telemetry")
+        st.subheader("📊 Zoom Velocity Telemetry")
         base = alt.Chart(df).encode(x='Time')
         
-        # Zoom Metric
-        zoom = base.mark_line(color='magenta').encode(
-            y=alt.Y('Zoom_Smooth', title='Zoom (Up)')
+        # Zoom Velocity (The Drop Signal)
+        zvel = base.mark_line(color='magenta').encode(
+            y=alt.Y('Zoom_Velocity', title='Zoom Velocity (Min = Drop)')
         )
         
-        # Vertical Jolt Metric
-        jolt = base.mark_line(color='orange').encode(
-            y=alt.Y('Y_Smooth', title='Vertical Jolt (Down)')
+        # Horizontal Flow (Context)
+        xflow = base.mark_area(color='cyan', opacity=0.3).encode(
+            y=alt.Y('X_Smooth', title='Horiz Motion')
         )
         
         rules = pd.DataFrame([
             {'t': t_up, 'c': 'green', 'l': 'Jacks Up'}, 
-            {'t': t_down, 'c': 'red', 'l': 'Jacks Down'},
-            {'t': t_end - 1.5, 'c': 'gray', 'l': 'Buffer Zone'}
+            {'t': t_down, 'c': 'red', 'l': 'Jacks Down'}
         ])
         rule_chart = alt.Chart(rules).mark_rule(strokeWidth=2).encode(x='t', color=alt.Color('c', scale=None))
         
-        st.altair_chart((zoom + jolt + rule_chart).interactive(), use_container_width=True)
+        st.altair_chart((xflow + zvel + rule_chart).interactive(), use_container_width=True)
         
         st.subheader("Video Result")
         c1, c2 = st.columns([3,1])
@@ -332,7 +345,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_final.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_snap_drop.mp4")
 
 if __name__ == "__main__":
     main()
