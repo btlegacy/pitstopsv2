@@ -107,9 +107,8 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis (Restored V23 Logic) ---
+# --- PASS 2: Analysis (Snap + Settle Logic) ---
 def analyze_states(df, fps):
-    # Smoothing
     window_slow = 15
     window_fast = 5
     if len(df) > window_slow:
@@ -121,10 +120,9 @@ def analyze_states(df, fps):
         df['Zoom_Smooth'] = df['Zoom_Score']
         df['Fuel_Smooth'] = df['Fuel_Matches']
 
-    # Derivative for Drop Detection
     df['Zoom_Velocity'] = np.gradient(df['Zoom_Smooth'])
 
-    # 1. PIT STOP (Horizontal Momentum)
+    # 1. PIT STOP
     x_mag = df['X_Smooth'].abs()
     MOVE_THRESH = x_mag.max() * 0.3 
     STOP_THRESH = x_mag.max() * 0.05 
@@ -135,24 +133,20 @@ def analyze_states(df, fps):
     if len(peaks) >= 2:
         arrival_idx = peaks[0]
         depart_idx = peaks[-1]
-        
         for i in range(arrival_idx, depart_idx):
             if x_mag.iloc[i] < STOP_THRESH:
                 t_start = df.iloc[i]['Time']
                 break
-        
         for i in range(depart_idx, arrival_idx, -1):
             if x_mag.iloc[i] < STOP_THRESH:
                 t_end = df.iloc[i]['Time']
                 break
     
-    # 2. JACKS (RESTORED V23 LOGIC: Max Velocity Drop)
+    # 2. JACKS (SNAP + SETTLE)
     t_up, t_down = None, None
     
     if t_start and t_end:
-        # Buffer: Stop looking 1s before departure to avoid exit noise
         t_creep_limit = t_end - 1.0
-        
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep_limit)]
         
         if not stop_window.empty:
@@ -160,27 +154,39 @@ def analyze_states(df, fps):
             z_vel = stop_window['Zoom_Velocity'].values
             times = stop_window['Time'].values
             
-            # A. FIND LIFT (First Expansion)
+            # Lift
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
                 t_up = times[peaks_up[0]]
             else:
                 t_up = t_start
                 
-            # B. FIND DROP (Global Minimum Zoom Velocity)
-            # Look strictly AFTER the lift
+            # Drop (Snap + Settle)
             drop_search_mask = (stop_window['Time'] > t_up + 1.0)
             
             if np.any(drop_search_mask):
                 drop_window_vel = z_vel[drop_search_mask]
                 drop_window_times = times[drop_search_mask]
                 
-                # The "Snap" is the single most negative velocity point
+                # 1. Find the Snap (Max Velocity)
                 min_idx = np.argmin(drop_window_vel)
                 min_val = drop_window_vel[min_idx]
                 
-                if min_val < -0.05: # Noise threshold
-                    t_down = drop_window_times[min_idx]
+                if min_val < -0.05:
+                    # 2. Find the Settle (Walk forward until velocity is near zero)
+                    # This accounts for the suspension settling time
+                    settle_idx = min_idx
+                    
+                    # Look ahead up to 1.0 second (fps frames)
+                    look_ahead_frames = int(fps * 1.0)
+                    
+                    for k in range(min_idx, min(len(drop_window_vel), min_idx + look_ahead_frames)):
+                        # If velocity returns to > -0.02 (effectively zero/flat)
+                        if drop_window_vel[k] > -0.02:
+                            settle_idx = k
+                            break
+                            
+                    t_down = drop_window_times[settle_idx]
                 else:
                     t_down = t_end
             else:
@@ -188,28 +194,21 @@ def analyze_states(df, fps):
 
     # 3. FUELING
     t_fuel_start, t_fuel_end = None, None
-    
     if t_start and t_end:
         fuel_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not fuel_window.empty:
             f_sig = fuel_window['Fuel_Smooth'].values
             times = fuel_window['Time'].values
             max_matches = np.max(f_sig)
-            
-            if max_matches > 10: # Confidence threshold
-                # Plateau detection
+            if max_matches > 10:
                 fuel_thresh = max_matches * 0.5
                 is_fueling = f_sig > fuel_thresh
-                
                 indices = np.where(is_fueling)[0]
                 if len(indices) > 0:
                     t_fuel_start = times[indices[0]]
                     t_fuel_end = times[indices[-1]]
-                    
-                    # Trim tail if it overlaps departure
                     if t_fuel_end > t_end - 0.5: t_fuel_end = t_end - 0.5
 
-    # Fallbacks
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
@@ -226,15 +225,15 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
     out = cv2.VideoWriter(temp_output.name, fourcc, fps, (width, height))
     
-    frame_idx = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_idx = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
         current_time = frame_idx / fps
         
-        # Pit Timer
+        # Timers
         if t_start and current_time >= t_start:
             if t_end and current_time >= t_end:
                 val_pit, col_pit = t_end - t_start, (0,0,255)
@@ -243,7 +242,6 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         else:
             val_pit, col_pit = 0.0, (200,200,200)
 
-        # Tire Timer
         if t_up and current_time >= t_up:
             if t_down and current_time >= t_down:
                 val_tire, col_tire = t_down - t_up, (0,0,255)
@@ -252,7 +250,6 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         else:
             val_tire, col_tire = 0.0, (200,200,200)
             
-        # Fuel Timer
         if t_f_start and current_time >= t_f_start:
             if t_f_end and current_time >= t_f_end:
                 val_fuel, col_fuel = t_f_end - t_f_start, (0,0,255)
@@ -263,7 +260,6 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         
         # UI
         cv2.rectangle(frame, (width-450, 0), (width, 240), (0,0,0), -1)
-        
         cv2.putText(frame, "PIT STOP", (width-430, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_pit:.2f}s", (width-180, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_pit, 3)
         
@@ -273,7 +269,7 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         cv2.putText(frame, "TIRES", (width-430, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
 
-        cv2.putText(frame, "V26: Restored Snap Drop", (width-430, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        cv2.putText(frame, "V27: Snap + Settle", (width-430, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -285,9 +281,9 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V26")
-    st.markdown("### Corrected Logic")
-    st.info("Restored 'Max Velocity Snap' for Tires (V23) while keeping Fuel detection.")
+    st.title("🏁 Pit Stop Analyzer V27")
+    st.markdown("### Snap + Settle Logic")
+    st.info("Detects the Drop Snap, then waits for the car to settle (velocity -> 0) before stopping the timer.")
 
     probe_path = os.path.join(BASE_DIR, "refs", "probein")
     if not os.path.exists(probe_path):
@@ -309,7 +305,7 @@ def main():
             st.write("Step 1: Extraction...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Logic Analysis (V23 Tire Logic)...")
+            st.write("Step 2: Logic Analysis...")
             pit_t, tire_t, fuel_t = analyze_states(df, fps)
             
             if pit_t[0] is None:
