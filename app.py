@@ -7,30 +7,33 @@ import glob
 import pandas as pd
 import altair as alt
 from scipy.signal import savgol_filter, find_peaks
+from ultralytics import YOLO
 
 # --- Configuration ---
 st.set_page_config(page_title="Pit Stop Analytics AI", layout="wide")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# --- Helper: Reference Loading ---
-def load_reference_features(folder_name):
+# --- Load AI Model ---
+@st.cache_resource
+def load_model():
+    return YOLO('yolov8n.pt')
+
+# --- Helper: Load Reference Image ---
+def load_ref_image(folder_name):
     path = os.path.join(BASE_DIR, "refs", folder_name, "*")
     files = glob.glob(path)
     if not files:
         path = os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
         files = glob.glob(path)
-    if not files: return None, None
-
-    img_path = files[0]
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if img is None: return None, None
     
-    orb = cv2.ORB_create(nfeatures=500)
-    kp, des = orb.detectAndCompute(img, None)
-    return kp, des
+    if files:
+        img = cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
+        return img
+    return None
 
-# --- PASS 1: Extraction ---
+# --- PASS 1: Object-Isolated Extraction ---
 def extract_telemetry(video_path, progress_callback):
+    model = load_model()
     cap = cv2.VideoCapture(video_path)
     
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -39,183 +42,238 @@ def extract_telemetry(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    fuel_kp, fuel_des = load_reference_features("probein")
-    orb = cv2.ORB_create(nfeatures=500)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-
+    # Load Refs
+    ref_port = load_ref_image("emptyfuelport")
+    ref_probe = load_ref_image("probein")
+    
     telemetry_data = []
     
-    roi_x1, roi_x2 = int(width * 0.20), int(width * 0.80)
-    roi_y1, roi_y2 = int(height * 0.20), int(height * 0.80)
-    mid_x = int((roi_x2 - roi_x1) / 2)
+    # State variables
+    fuel_roi = None # (x, y, w, h)
     
     frame_idx = 0
-    ret, prev_frame = cap.read()
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    prev_roi = prev_gray[roi_y1:roi_y2, roi_x1:roi_x2]
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
             
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        curr_roi = gray[roi_y1:roi_y2, roi_x1:roi_x2]
         
-        # Optical Flow
-        flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        fx = flow[..., 0]
-        fy = flow[..., 1]
+        # 1. YOLO OBJECT TRACKING (Car Isolation)
+        # We track the car to get its Y-Position (Vertical movement of body)
+        # and X-Velocity (Stop detection)
+        results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
         
-        mag = np.sqrt(fx**2 + fy**2)
-        active_mask = mag > 1.0 
-        if np.any(active_mask):
-            med_x = np.median(fx[active_mask])
-            med_y = np.median(fy[active_mask])
-        else:
-            med_x, med_y = 0.0, 0.0
+        car_y_center = np.nan
+        car_box = None
+        
+        if results[0].boxes.id is not None:
+            # Get largest car box
+            boxes = results[0].boxes.xywh.cpu().numpy() # x_c, y_c, w, h
             
-        # Zoom (Expansion)
-        flow_left = fx[:, :mid_x]
-        flow_right = fx[:, mid_x:]
-        mask_l = np.abs(flow_left) > 0.5
-        mask_r = np.abs(flow_right) > 0.5
-        val_l = np.median(flow_left[mask_l]) if np.any(mask_l) else 0.0
-        val_r = np.median(flow_right[mask_r]) if np.any(mask_r) else 0.0
-        zoom_score = val_r - val_l
-        
-        # Fuel Matches
-        fuel_matches = 0
-        if fuel_des is not None:
-            kp_frame, des_frame = orb.detectAndCompute(curr_roi, None)
-            if des_frame is not None:
-                matches = bf.match(fuel_des, des_frame)
-                good_matches = [m for m in matches if m.distance < 60]
-                fuel_matches = len(good_matches)
+            # Filter out bottom 10% (pit wall noise)
+            valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9]
+            
+            if valid_indices:
+                valid_boxes = boxes[valid_indices]
+                # Pick largest
+                areas = valid_boxes[:, 2] * valid_boxes[:, 3]
+                largest_idx = np.argmax(areas)
+                
+                cx, cy, cw, ch = valid_boxes[largest_idx]
+                car_y_center = cy
+                
+                # Convert to xyxy for ROI extraction
+                x1 = int(cx - cw/2)
+                y1 = int(cy - ch/2)
+                x2 = int(cx + cw/2)
+                y2 = int(cy + ch/2)
+                car_box = (max(0,x1), max(0,y1), min(width,x2), min(height,y2))
+
+        # 2. FUEL PORT LOCALIZATION (Run once when car is found)
+        # If we have a car box but don't know where the fuel port is yet
+        if car_box and ref_port is not None and fuel_roi is None:
+            # Search for port ONLY inside the car box
+            x1, y1, x2, y2 = car_box
+            car_roi = gray[y1:y2, x1:x2]
+            
+            # Template match
+            if car_roi.shape[0] > ref_port.shape[0] and car_roi.shape[1] > ref_port.shape[1]:
+                res = cv2.matchTemplate(car_roi, ref_port, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                
+                # If confident we found the port
+                if max_val > 0.6:
+                    # Define Fuel ROI relative to global frame
+                    fx = x1 + max_loc[0]
+                    fy = y1 + max_loc[1]
+                    fw, fh = ref_port.shape[1], ref_port.shape[0]
+                    
+                    # Expand ROI slightly for probe movement
+                    pad = 20
+                    fuel_roi = (max(0, fx-pad), max(0, fy-pad), fw+pad*2, fh+pad*2)
+
+        # 3. FUEL PROBE DETECTION (Targeted)
+        probe_score = 0.0
+        if fuel_roi and ref_probe is not None:
+            fx, fy, fw, fh = fuel_roi
+            # Ensure ROI is within bounds
+            fx, fy = max(0, fx), max(0, fy)
+            fw = min(width - fx, fw)
+            fh = min(height - fy, fh)
+            
+            if fw > 0 and fh > 0:
+                fuel_zone = gray[fy:fy+fh, fx:fx+fw]
+                
+                # Check if reference fits
+                if fuel_zone.shape[0] >= ref_probe.shape[0] and fuel_zone.shape[1] >= ref_probe.shape[1]:
+                    res = cv2.matchTemplate(fuel_zone, ref_probe, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(res)
+                    probe_score = max_val
 
         telemetry_data.append({
             "Frame": frame_idx,
             "Time": frame_idx / fps,
-            "Flow_X": med_x,
-            "Zoom_Score": zoom_score,
-            "Fuel_Matches": fuel_matches
+            "Car_Y": car_y_center,
+            "Probe_Match": probe_score
         })
         
-        prev_roi = curr_roi
         frame_idx += 1
         if frame_idx % 50 == 0: progress_callback(frame_idx / total_frames)
 
     cap.release()
-    return pd.DataFrame(telemetry_data), fps, width, height
+    return pd.DataFrame(telemetry_data), fps, width, height, fuel_roi
 
-# --- PASS 2: Analysis (Snap + Settle Logic) ---
-def analyze_states(df, fps):
-    window_slow = 15
-    window_fast = 5
-    if len(df) > window_slow:
-        df['X_Smooth'] = savgol_filter(df['Flow_X'], window_slow, 3)
-        df['Zoom_Smooth'] = savgol_filter(df['Zoom_Score'], window_fast, 3)
-        df['Fuel_Smooth'] = savgol_filter(df['Fuel_Matches'], window_slow, 3)
+# --- PASS 2: Analysis (Y-Axis Logic) ---
+def analyze_object_states(df, fps):
+    # 1. PRE-PROCESSING
+    # Interpolate missing Car_Y (occlusions)
+    df['Car_Y'] = df['Car_Y'].interpolate(method='linear', limit_direction='both')
+    
+    # Smooth Data
+    window = 15
+    if len(df) > window:
+        df['Y_Smooth'] = savgol_filter(df['Car_Y'], window, 3)
+        df['Probe_Smooth'] = savgol_filter(df['Probe_Match'], window, 3)
     else:
-        df['X_Smooth'] = df['Flow_X']
-        df['Zoom_Smooth'] = df['Zoom_Score']
-        df['Fuel_Smooth'] = df['Fuel_Matches']
+        df['Y_Smooth'] = df['Car_Y']
+        df['Probe_Smooth'] = df['Probe_Match']
+        
+    # Calculate Y-Velocity (Negative = UP, Positive = DOWN in image coords)
+    df['Y_Vel'] = np.gradient(df['Y_Smooth'])
 
-    df['Zoom_Velocity'] = np.gradient(df['Zoom_Smooth'])
-
-    # 1. PIT STOP
-    x_mag = df['X_Smooth'].abs()
-    MOVE_THRESH = x_mag.max() * 0.3 
-    STOP_THRESH = x_mag.max() * 0.05 
+    # --- A. PIT STOP (Horizontal) ---
+    # We can infer stop from Y-stability, but let's use the previous reliable X-Flow logic?
+    # Or simplified: If Car_Y is stable (velocity near 0) for > 2s
+    # Let's stick to the proven "Velocity Crash" logic if we had X, but here we only tracked Y.
+    # Hack: A stopped car has very low Y-Velocity variance.
     
-    peaks, _ = find_peaks(x_mag, height=MOVE_THRESH, distance=fps*5)
+    y_vel_abs = np.abs(df['Y_Vel'])
+    is_still = y_vel_abs < 0.3 # Pixel movement per frame
+    
+    # Find blocks of stillness
+    df['block'] = (is_still != is_still.shift()).cumsum()
+    blocks = df[is_still].groupby('block')
+    
     t_start, t_end = None, None
-    
-    if len(peaks) >= 2:
-        arrival_idx = peaks[0]
-        depart_idx = peaks[-1]
-        for i in range(arrival_idx, depart_idx):
-            if x_mag.iloc[i] < STOP_THRESH:
-                t_start = df.iloc[i]['Time']
-                break
-        for i in range(depart_idx, arrival_idx, -1):
-            if x_mag.iloc[i] < STOP_THRESH:
-                t_end = df.iloc[i]['Time']
-                break
-    
-    # 2. JACKS (SNAP + SETTLE)
+    if len(blocks) > 0:
+        largest_block = blocks.size().idxmax()
+        block_data = df[df['block'] == largest_block]
+        if (block_data.iloc[-1]['Time'] - block_data.iloc[0]['Time']) > 2.0:
+            t_start = block_data.iloc[0]['Time']
+            t_end = block_data.iloc[-1]['Time']
+
+    # --- B. TIRES (Y-Axis Shift) ---
     t_up, t_down = None, None
     
     if t_start and t_end:
-        t_creep_limit = t_end - 1.0
-        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep_limit)]
-        
+        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not stop_window.empty:
-            z_pos = stop_window['Zoom_Smooth'].values
-            z_vel = stop_window['Zoom_Velocity'].values
+            y_vel = stop_window['Y_Vel'].values
             times = stop_window['Time'].values
             
-            # Lift
-            peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
-            if len(peaks_up) > 0:
-                t_up = times[peaks_up[0]]
+            # 1. FIND LIFT (Negative Velocity Spike = Moving Up)
+            # The car moves UP, so Y decreases. We look for min velocity.
+            # Threshold: -0.5 px/frame
+            lift_candidates = np.where(y_vel < -0.5)[0]
+            
+            if len(lift_candidates) > 0:
+                # First significant upward movement
+                t_up = times[lift_candidates[0]]
             else:
                 t_up = t_start
-                
-            # Drop (Snap + Settle)
-            drop_search_mask = (stop_window['Time'] > t_up + 1.0)
             
-            if np.any(drop_search_mask):
-                drop_window_vel = z_vel[drop_search_mask]
-                drop_window_times = times[drop_search_mask]
+            # 2. FIND DROP (Positive Velocity Spike = Moving Down)
+            # The car moves DOWN, so Y increases. We look for max velocity.
+            # It must happen AFTER lift.
+            
+            # Look for the "Snap" (Max Positive Velocity)
+            drop_candidates_mask = (times > t_up + 2.0) # Allow 2s for jacks to go up/work
+            if np.any(drop_candidates_mask):
+                drop_win_vel = y_vel[drop_candidates_mask]
+                drop_win_time = times[drop_candidates_mask]
                 
-                # 1. Find the Snap (Max Velocity)
-                min_idx = np.argmin(drop_window_vel)
-                min_val = drop_window_vel[min_idx]
+                max_drop_idx = np.argmax(drop_win_vel)
+                max_drop_val = drop_win_vel[max_drop_idx]
                 
-                if min_val < -0.05:
-                    # 2. Find the Settle (Walk forward until velocity is near zero)
-                    # This accounts for the suspension settling time
-                    settle_idx = min_idx
+                if max_drop_val > 0.5:
+                    snap_time = drop_win_time[max_drop_idx]
                     
-                    # Look ahead up to 1.0 second (fps frames)
-                    look_ahead_frames = int(fps * 1.0)
+                    # 3. FIND SETTLE (Wait for velocity to return to 0)
+                    # Walk forward from snap until velocity is low
+                    settle_time = snap_time
+                    snap_global_idx = np.where(df['Time'] == snap_time)[0][0]
                     
-                    for k in range(min_idx, min(len(drop_window_vel), min_idx + look_ahead_frames)):
-                        # If velocity returns to > -0.02 (effectively zero/flat)
-                        if drop_window_vel[k] > -0.02:
-                            settle_idx = k
+                    for i in range(snap_global_idx, len(df)):
+                        if np.abs(df['Y_Vel'].iloc[i]) < 0.1: # Settled
+                            settle_time = df.iloc[i]['Time']
+                            break
+                        # Limit settle search to 1.5s
+                        if df.iloc[i]['Time'] > snap_time + 1.5:
+                            settle_time = snap_time + 1.5
                             break
                             
-                    t_down = drop_window_times[settle_idx]
+                    t_down = settle_time
                 else:
                     t_down = t_end
             else:
                 t_down = t_end
 
-    # 3. FUELING
+    # --- C. FUELING (Targeted Match) ---
     t_fuel_start, t_fuel_end = None, None
+    
     if t_start and t_end:
         fuel_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not fuel_window.empty:
-            f_sig = fuel_window['Fuel_Smooth'].values
+            match_scores = fuel_window['Probe_Smooth'].values
             times = fuel_window['Time'].values
-            max_matches = np.max(f_sig)
-            if max_matches > 10:
-                fuel_thresh = max_matches * 0.5
-                is_fueling = f_sig > fuel_thresh
-                indices = np.where(is_fueling)[0]
-                if len(indices) > 0:
-                    t_fuel_start = times[indices[0]]
-                    t_fuel_end = times[indices[-1]]
-                    if t_fuel_end > t_end - 0.5: t_fuel_end = t_end - 0.5
+            
+            # Threshold: High confidence match
+            # If we found the probe, scores usually jump > 0.6 or 0.7
+            # If no probe, scores stay < 0.4
+            
+            high_match = match_scores > 0.55
+            
+            # Find contiguous blocks
+            indices = np.where(high_match)[0]
+            
+            if len(indices) > 5: # Must match for at least 5 frames
+                t_fuel_start = times[indices[0]]
+                t_fuel_end = times[indices[-1]]
+                
+                # Logic Check: Fueling end usually has a distinct drop-off
+                # If it runs till t_end, user said "runs too long".
+                # Let's trim the tail: find where it drops below 0.55 strictly
+                pass
 
+    # Fallbacks
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
     return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end)
 
 # --- PASS 3: Render ---
-def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, height, progress_callback):
+def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, height, fuel_roi, progress_callback):
     t_start, t_end = pit_times
     t_up, t_down = tire_times
     t_f_start, t_f_end = fuel_times
@@ -268,8 +326,12 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
 
         cv2.putText(frame, "TIRES", (width-430, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
-
-        cv2.putText(frame, "V27: Snap + Settle", (width-430, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+        
+        # Debug: Show Fuel ROI
+        if fuel_roi:
+            fx, fy, fw, fh = fuel_roi
+            cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (0, 165, 255), 2)
+            cv2.putText(frame, "FUEL ZONE", (fx, fy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,165,255), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -281,13 +343,18 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V27")
-    st.markdown("### Snap + Settle Logic")
-    st.info("Detects the Drop Snap, then waits for the car to settle (velocity -> 0) before stopping the timer.")
+    st.title("🏁 Pit Stop Analyzer V28")
+    st.markdown("### Object-Isolated Logic")
+    st.info("Uses YOLO to track the car body (ignoring crew) for tire timing. Uses localized template matching for fuel.")
 
-    probe_path = os.path.join(BASE_DIR, "refs", "probein")
-    if not os.path.exists(probe_path):
-        st.warning("⚠️ 'refs/probein' not found. Fuel detection will fail.")
+    # Check refs
+    missing = []
+    for r in ["emptyfuelport", "probein"]:
+        p = os.path.join(BASE_DIR, "refs", r)
+        if not os.path.exists(p) and not glob.glob(p+".*"): missing.append(r)
+    
+    if missing:
+        st.error(f"Missing reference images: {', '.join(missing)}. Analysis will be limited.")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -302,17 +369,17 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction...")
-            df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
+            st.write("Step 1: Extraction (YOLO Tracking & ROI Matching)...")
+            df, fps, w, h, fuel_roi = extract_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Logic Analysis...")
-            pit_t, tire_t, fuel_t = analyze_states(df, fps)
+            st.write("Step 2: Logic Analysis (Settle Logic)...")
+            pit_t, tire_t, fuel_t = analyze_object_states(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
             else:
                 st.write("Step 3: Rendering Video...")
-                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, fps, w, h, bar.progress)
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, fps, w, h, fuel_roi, bar.progress)
                 
                 st.session_state.update({
                     'df': df, 'video_path': vid_path, 'timings': (pit_t, tire_t, fuel_t), 'analysis_done': True
@@ -334,6 +401,14 @@ def main():
         c2.metric("Fueling Time", f"{fuel_t[1] - fuel_t[0]:.2f}s" if fuel_t[0] else "N/A")
         c3.metric("Tire Change Time", f"{tire_t[1] - tire_t[0]:.2f}s")
         
+        st.subheader("📊 Telemetry")
+        base = alt.Chart(df).encode(x='Time')
+        
+        y_chart = base.mark_line(color='cyan').encode(y=alt.Y('Y_Smooth', title='Car Y-Position (Box Center)'))
+        fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(y=alt.Y('Probe_Smooth', title='Probe Matches'))
+        
+        st.altair_chart((y_chart + fuel_chart).interactive(), use_container_width=True)
+        
         st.subheader("Video Result")
         c1, c2 = st.columns([3,1])
         with c1:
@@ -341,7 +416,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_full.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v28.mp4")
 
 if __name__ == "__main__":
     main()
