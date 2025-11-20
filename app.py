@@ -25,14 +25,12 @@ def load_ref_image(folder_name):
     if not files:
         path = os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
         files = glob.glob(path)
-    
     if files:
-        img = cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
-        return img
+        return cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
     return None
 
-# --- PASS 1: Object-Isolated Extraction ---
-def extract_telemetry(video_path, progress_callback):
+# --- PASS 1: Hybrid Extraction (Flow + YOLO + Template) ---
+def extract_hybrid_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
     
@@ -48,9 +46,16 @@ def extract_telemetry(video_path, progress_callback):
     
     telemetry_data = []
     
-    # State variables
-    fuel_roi = None # (x, y, w, h)
+    # Optical Flow Setup (ROI: Center)
+    roi_x1, roi_x2 = int(width * 0.20), int(width * 0.80)
+    roi_y1, roi_y2 = int(height * 0.20), int(height * 0.80)
     
+    ret, prev_frame = cap.read()
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    prev_roi = prev_gray[roi_y1:roi_y2, roi_x1:roi_x2]
+    
+    # State variables
+    fuel_roi = None 
     frame_idx = 0
     
     while cap.isOpened():
@@ -58,74 +63,68 @@ def extract_telemetry(video_path, progress_callback):
         if not ret: break
             
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        curr_roi = gray[roi_y1:roi_y2, roi_x1:roi_x2]
         
-        # 1. YOLO OBJECT TRACKING (Car Isolation)
-        # We track the car to get its Y-Position (Vertical movement of body)
-        # and X-Velocity (Stop detection)
+        # --- 1. OPTICAL FLOW (For Stop/Go) ---
+        flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 
+                                            0.5, 3, 15, 3, 5, 1.2, 0)
+        fx = flow[..., 0]
+        fy = flow[..., 1]
+        
+        mag = np.sqrt(fx**2 + fy**2)
+        active_mask = mag > 1.0 
+        if np.any(active_mask):
+            flow_x = np.median(fx[active_mask])
+        else:
+            flow_x = 0.0
+            
+        # --- 2. YOLO (For Tire Change / Car Y) ---
         results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
-        
-        car_y_center = np.nan
+        car_y = np.nan
         car_box = None
         
         if results[0].boxes.id is not None:
-            # Get largest car box
-            boxes = results[0].boxes.xywh.cpu().numpy() # x_c, y_c, w, h
-            
-            # Filter out bottom 10% (pit wall noise)
+            boxes = results[0].boxes.xywh.cpu().numpy()
             valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9]
             
             if valid_indices:
                 valid_boxes = boxes[valid_indices]
-                # Pick largest
                 areas = valid_boxes[:, 2] * valid_boxes[:, 3]
                 largest_idx = np.argmax(areas)
-                
                 cx, cy, cw, ch = valid_boxes[largest_idx]
-                car_y_center = cy
+                car_y = cy
                 
-                # Convert to xyxy for ROI extraction
                 x1 = int(cx - cw/2)
                 y1 = int(cy - ch/2)
                 x2 = int(cx + cw/2)
                 y2 = int(cy + ch/2)
                 car_box = (max(0,x1), max(0,y1), min(width,x2), min(height,y2))
 
-        # 2. FUEL PORT LOCALIZATION (Run once when car is found)
-        # If we have a car box but don't know where the fuel port is yet
+        # --- 3. FUEL (Template Match) ---
+        # Locate Port Once
         if car_box and ref_port is not None and fuel_roi is None:
-            # Search for port ONLY inside the car box
             x1, y1, x2, y2 = car_box
-            car_roi = gray[y1:y2, x1:x2]
-            
-            # Template match
-            if car_roi.shape[0] > ref_port.shape[0] and car_roi.shape[1] > ref_port.shape[1]:
-                res = cv2.matchTemplate(car_roi, ref_port, cv2.TM_CCOEFF_NORMED)
-                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                
-                # If confident we found the port
+            car_roi_img = gray[y1:y2, x1:x2]
+            if car_roi_img.shape[0] > ref_port.shape[0] and car_roi_img.shape[1] > ref_port.shape[1]:
+                res = cv2.matchTemplate(car_roi_img, ref_port, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
                 if max_val > 0.6:
-                    # Define Fuel ROI relative to global frame
                     fx = x1 + max_loc[0]
                     fy = y1 + max_loc[1]
                     fw, fh = ref_port.shape[1], ref_port.shape[0]
-                    
-                    # Expand ROI slightly for probe movement
-                    pad = 20
-                    fuel_roi = (max(0, fx-pad), max(0, fy-pad), fw+pad*2, fh+pad*2)
+                    fuel_roi = (max(0, fx-20), max(0, fy-20), fw+40, fh+40)
 
-        # 3. FUEL PROBE DETECTION (Targeted)
+        # Detect Probe
         probe_score = 0.0
         if fuel_roi and ref_probe is not None:
             fx, fy, fw, fh = fuel_roi
-            # Ensure ROI is within bounds
+            # Boundary checks
             fx, fy = max(0, fx), max(0, fy)
             fw = min(width - fx, fw)
             fh = min(height - fy, fh)
             
             if fw > 0 and fh > 0:
                 fuel_zone = gray[fy:fy+fh, fx:fx+fw]
-                
-                # Check if reference fits
                 if fuel_zone.shape[0] >= ref_probe.shape[0] and fuel_zone.shape[1] >= ref_probe.shape[1]:
                     res = cv2.matchTemplate(fuel_zone, ref_probe, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(res)
@@ -134,139 +133,107 @@ def extract_telemetry(video_path, progress_callback):
         telemetry_data.append({
             "Frame": frame_idx,
             "Time": frame_idx / fps,
-            "Car_Y": car_y_center,
+            "Flow_X": flow_x,
+            "Car_Y": car_y,
             "Probe_Match": probe_score
         })
         
+        prev_roi = curr_roi
         frame_idx += 1
         if frame_idx % 50 == 0: progress_callback(frame_idx / total_frames)
 
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height, fuel_roi
 
-# --- PASS 2: Analysis (Y-Axis Logic) ---
-def analyze_object_states(df, fps):
-    # 1. PRE-PROCESSING
-    # Interpolate missing Car_Y (occlusions)
-    df['Car_Y'] = df['Car_Y'].interpolate(method='linear', limit_direction='both')
-    
-    # Smooth Data
+# --- PASS 2: Hybrid Analysis ---
+def analyze_hybrid_states(df, fps):
+    # Smoothing
     window = 15
     if len(df) > window:
-        df['Y_Smooth'] = savgol_filter(df['Car_Y'], window, 3)
+        df['Flow_X_Smooth'] = savgol_filter(df['Flow_X'], window, 3)
+        df['Car_Y'] = df['Car_Y'].interpolate(method='linear', limit_direction='both')
+        df['Car_Y_Smooth'] = savgol_filter(df['Car_Y'], window, 3)
         df['Probe_Smooth'] = savgol_filter(df['Probe_Match'], window, 3)
     else:
-        df['Y_Smooth'] = df['Car_Y']
+        df['Flow_X_Smooth'] = df['Flow_X']
+        df['Car_Y_Smooth'] = df['Car_Y']
         df['Probe_Smooth'] = df['Probe_Match']
-        
-    # Calculate Y-Velocity (Negative = UP, Positive = DOWN in image coords)
-    df['Y_Vel'] = np.gradient(df['Y_Smooth'])
 
-    # --- A. PIT STOP (Horizontal) ---
-    # We can infer stop from Y-stability, but let's use the previous reliable X-Flow logic?
-    # Or simplified: If Car_Y is stable (velocity near 0) for > 2s
-    # Let's stick to the proven "Velocity Crash" logic if we had X, but here we only tracked Y.
-    # Hack: A stopped car has very low Y-Velocity variance.
+    # 1. PIT STOP (Using Optical Flow - Proven V27 Logic)
+    x_mag = df['Flow_X_Smooth'].abs()
+    MOVE_THRESH = x_mag.max() * 0.3 
+    STOP_THRESH = x_mag.max() * 0.05 
     
-    y_vel_abs = np.abs(df['Y_Vel'])
-    is_still = y_vel_abs < 0.3 # Pixel movement per frame
-    
-    # Find blocks of stillness
-    df['block'] = (is_still != is_still.shift()).cumsum()
-    blocks = df[is_still].groupby('block')
-    
+    peaks, _ = find_peaks(x_mag, height=MOVE_THRESH, distance=fps*5)
     t_start, t_end = None, None
-    if len(blocks) > 0:
-        largest_block = blocks.size().idxmax()
-        block_data = df[df['block'] == largest_block]
-        if (block_data.iloc[-1]['Time'] - block_data.iloc[0]['Time']) > 2.0:
-            t_start = block_data.iloc[0]['Time']
-            t_end = block_data.iloc[-1]['Time']
-
-    # --- B. TIRES (Y-Axis Shift) ---
+    
+    if len(peaks) >= 2:
+        arrival_idx = peaks[0]
+        depart_idx = peaks[-1]
+        for i in range(arrival_idx, depart_idx):
+            if x_mag.iloc[i] < STOP_THRESH:
+                t_start = df.iloc[i]['Time']
+                break
+        for i in range(depart_idx, arrival_idx, -1):
+            if x_mag.iloc[i] < STOP_THRESH:
+                t_end = df.iloc[i]['Time']
+                break
+    
+    # 2. TIRES (Using YOLO Car_Y - Object Isolated)
     t_up, t_down = None, None
     
     if t_start and t_end:
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not stop_window.empty:
-            y_vel = stop_window['Y_Vel'].values
+            # Calculate Velocity of the CAR OBJECT
+            y_pos = stop_window['Car_Y_Smooth'].values
+            y_vel = np.gradient(y_pos)
             times = stop_window['Time'].values
             
-            # 1. FIND LIFT (Negative Velocity Spike = Moving Up)
-            # The car moves UP, so Y decreases. We look for min velocity.
-            # Threshold: -0.5 px/frame
-            lift_candidates = np.where(y_vel < -0.5)[0]
-            
-            if len(lift_candidates) > 0:
-                # First significant upward movement
-                t_up = times[lift_candidates[0]]
+            # LIFT: Car moves UP (Y decreases) -> Negative Velocity
+            # Find min velocity (max upward speed)
+            min_idx = np.argmin(y_vel)
+            if y_vel[min_idx] < -0.2: # Threshold for "Moving Up"
+                t_up = times[min_idx]
             else:
                 t_up = t_start
             
-            # 2. FIND DROP (Positive Velocity Spike = Moving Down)
-            # The car moves DOWN, so Y increases. We look for max velocity.
-            # It must happen AFTER lift.
-            
-            # Look for the "Snap" (Max Positive Velocity)
-            drop_candidates_mask = (times > t_up + 2.0) # Allow 2s for jacks to go up/work
-            if np.any(drop_candidates_mask):
-                drop_win_vel = y_vel[drop_candidates_mask]
-                drop_win_time = times[drop_candidates_mask]
+            # DROP: Car moves DOWN (Y increases) -> Positive Velocity
+            # Look for Max Velocity AFTER the lift
+            drop_mask = times > t_up + 1.0
+            if np.any(drop_mask):
+                drop_vel = y_vel[drop_mask]
+                drop_times = times[drop_mask]
                 
-                max_drop_idx = np.argmax(drop_win_vel)
-                max_drop_val = drop_win_vel[max_drop_idx]
-                
-                if max_drop_val > 0.5:
-                    snap_time = drop_win_time[max_drop_idx]
-                    
-                    # 3. FIND SETTLE (Wait for velocity to return to 0)
-                    # Walk forward from snap until velocity is low
-                    settle_time = snap_time
-                    snap_global_idx = np.where(df['Time'] == snap_time)[0][0]
-                    
-                    for i in range(snap_global_idx, len(df)):
-                        if np.abs(df['Y_Vel'].iloc[i]) < 0.1: # Settled
-                            settle_time = df.iloc[i]['Time']
-                            break
-                        # Limit settle search to 1.5s
-                        if df.iloc[i]['Time'] > snap_time + 1.5:
-                            settle_time = snap_time + 1.5
-                            break
-                            
-                    t_down = settle_time
+                max_idx = np.argmax(drop_vel)
+                if drop_vel[max_idx] > 0.2: # Threshold for "Moving Down"
+                    t_down = drop_times[max_idx]
                 else:
                     t_down = t_end
             else:
                 t_down = t_end
 
-    # --- C. FUELING (Targeted Match) ---
+    # 3. FUELING (Using ROI Template Match)
     t_fuel_start, t_fuel_end = None, None
     
     if t_start and t_end:
         fuel_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not fuel_window.empty:
-            match_scores = fuel_window['Probe_Smooth'].values
+            matches = fuel_window['Probe_Smooth'].values
             times = fuel_window['Time'].values
             
-            # Threshold: High confidence match
-            # If we found the probe, scores usually jump > 0.6 or 0.7
-            # If no probe, scores stay < 0.4
+            # High confidence match
+            is_fueling = matches > 0.6
+            indices = np.where(is_fueling)[0]
             
-            high_match = match_scores > 0.55
-            
-            # Find contiguous blocks
-            indices = np.where(high_match)[0]
-            
-            if len(indices) > 5: # Must match for at least 5 frames
+            if len(indices) > 5:
                 t_fuel_start = times[indices[0]]
-                t_fuel_end = times[indices[-1]]
                 
-                # Logic Check: Fueling end usually has a distinct drop-off
-                # If it runs till t_end, user said "runs too long".
-                # Let's trim the tail: find where it drops below 0.55 strictly
-                pass
+                # Find where it drops off significantly
+                # Look for the last index where match > 0.6
+                # Then walk forward a bit? No, strict cut off is better for "runs too long"
+                t_fuel_end = times[indices[-1]]
 
-    # Fallbacks
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
@@ -291,33 +258,28 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
         if not ret: break
         current_time = frame_idx / fps
         
-        # Timers
+        # Timer Logic
         if t_start and current_time >= t_start:
-            if t_end and current_time >= t_end:
-                val_pit, col_pit = t_end - t_start, (0,0,255)
-            else:
-                val_pit, col_pit = current_time - t_start, (0,255,0)
+            val_pit = (t_end - t_start) if (t_end and current_time >= t_end) else (current_time - t_start)
+            col_pit = (0,0,255) if (t_end and current_time >= t_end) else (0,255,0)
         else:
             val_pit, col_pit = 0.0, (200,200,200)
 
         if t_up and current_time >= t_up:
-            if t_down and current_time >= t_down:
-                val_tire, col_tire = t_down - t_up, (0,0,255)
-            else:
-                val_tire, col_tire = current_time - t_up, (0,255,255)
+            val_tire = (t_down - t_up) if (t_down and current_time >= t_down) else (current_time - t_up)
+            col_tire = (0,0,255) if (t_down and current_time >= t_down) else (0,255,255)
         else:
             val_tire, col_tire = 0.0, (200,200,200)
             
         if t_f_start and current_time >= t_f_start:
-            if t_f_end and current_time >= t_f_end:
-                val_fuel, col_fuel = t_f_end - t_f_start, (0,0,255)
-            else:
-                val_fuel, col_fuel = current_time - t_f_start, (255,165,0)
+            val_fuel = (t_f_end - t_f_start) if (t_f_end and current_time >= t_f_end) else (current_time - t_f_start)
+            col_fuel = (0,0,255) if (t_f_end and current_time >= t_f_end) else (255,165,0)
         else:
             val_fuel, col_fuel = 0.0, (200,200,200)
         
-        # UI
+        # Draw
         cv2.rectangle(frame, (width-450, 0), (width, 240), (0,0,0), -1)
+        
         cv2.putText(frame, "PIT STOP", (width-430, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_pit:.2f}s", (width-180, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_pit, 3)
         
@@ -326,12 +288,14 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
 
         cv2.putText(frame, "TIRES", (width-430, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width-180, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col_tire, 3)
+
+        cv2.putText(frame, "V29: Hybrid Flow+YOLO", (width-430, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
         
-        # Debug: Show Fuel ROI
-        if fuel_roi:
+        # Visualize Fuel ROI
+        if fuel_roi and t_start and current_time > t_start:
             fx, fy, fw, fh = fuel_roi
-            cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (0, 165, 255), 2)
-            cv2.putText(frame, "FUEL ZONE", (fx, fy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,165,255), 1)
+            color = (0,255,0) if (t_f_start and t_f_start <= current_time <= t_f_end) else (0,165,255)
+            cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), color, 2)
 
         out.write(frame)
         frame_idx += 1
@@ -343,18 +307,15 @@ def render_overlay(input_path, pit_times, tire_times, fuel_times, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V28")
-    st.markdown("### Object-Isolated Logic")
-    st.info("Uses YOLO to track the car body (ignoring crew) for tire timing. Uses localized template matching for fuel.")
+    st.title("🏁 Pit Stop Analyzer V29")
+    st.markdown("### Hybrid Architecture")
+    st.info("Stop/Go: Optical Flow (Robust). Tires: YOLO Body Track (Precise). Fuel: ROI Template (Targeted).")
 
-    # Check refs
     missing = []
     for r in ["emptyfuelport", "probein"]:
         p = os.path.join(BASE_DIR, "refs", r)
         if not os.path.exists(p) and not glob.glob(p+".*"): missing.append(r)
-    
-    if missing:
-        st.error(f"Missing reference images: {', '.join(missing)}. Analysis will be limited.")
+    if missing: st.error(f"Missing refs: {missing}")
 
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -369,17 +330,18 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (YOLO Tracking & ROI Matching)...")
-            df, fps, w, h, fuel_roi = extract_telemetry(tfile.name, bar.progress)
+            st.write("Step 1: Hybrid Extraction (Flow + YOLO + Matches)...")
+            df, fps, w, h, froi = extract_hybrid_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Logic Analysis (Settle Logic)...")
-            pit_t, tire_t, fuel_t = analyze_object_states(df, fps)
+            st.write("Step 2: Multi-Signal Analysis...")
+            pit_t, tire_t, fuel_t = analyze_hybrid_states(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
+                st.altair_chart(alt.Chart(df).mark_line().encode(x='Time', y='Flow_X'), use_container_width=True)
             else:
                 st.write("Step 3: Rendering Video...")
-                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, fps, w, h, fuel_roi, bar.progress)
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, fps, w, h, froi, bar.progress)
                 
                 st.session_state.update({
                     'df': df, 'video_path': vid_path, 'timings': (pit_t, tire_t, fuel_t), 'analysis_done': True
@@ -401,14 +363,6 @@ def main():
         c2.metric("Fueling Time", f"{fuel_t[1] - fuel_t[0]:.2f}s" if fuel_t[0] else "N/A")
         c3.metric("Tire Change Time", f"{tire_t[1] - tire_t[0]:.2f}s")
         
-        st.subheader("📊 Telemetry")
-        base = alt.Chart(df).encode(x='Time')
-        
-        y_chart = base.mark_line(color='cyan').encode(y=alt.Y('Y_Smooth', title='Car Y-Position (Box Center)'))
-        fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(y=alt.Y('Probe_Smooth', title='Probe Matches'))
-        
-        st.altair_chart((y_chart + fuel_chart).interactive(), use_container_width=True)
-        
         st.subheader("Video Result")
         c1, c2 = st.columns([3,1])
         with c1:
@@ -416,7 +370,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v28.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_hybrid_v29.mp4")
 
 if __name__ == "__main__":
     main()
