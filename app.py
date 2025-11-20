@@ -77,33 +77,18 @@ def extract_telemetry(video_path, progress_callback):
         zoom_score = val_r - val_l
         
         # 2. 4-CORNER ACTIVITY DETECTION
-        # We divide the screen relative to the center to monitor the 4 quadrants
-        # This detects crew movement around the tires.
-        # Top-Left (TL), Top-Right (TR), Bottom-Left (BL), Bottom-Right (BR)
-        
-        # We use magnitude of flow in these quadrants
         h_roi, w_roi = curr_roi.shape
         mid_h, mid_w = h_roi // 2, w_roi // 2
-        
-        # Quadrant Flow Magnitudes (Mean of active pixels)
-        # We measure "Energy" in each corner
         q_mag = mag 
         
-        # Top Left
         act_tl = np.mean(q_mag[:mid_h, :mid_w])
-        # Top Right
         act_tr = np.mean(q_mag[:mid_h, mid_w:])
-        # Bottom Left
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
-        # Bottom Right
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
         # 3. FUEL (Template)
-        # Simple scan of center area
         probe_score = 0.0
         if ref_probe is not None:
-             # Optimization: Only scan if we are stopped (checked later, but extraction happens now)
-             # Scan center ROI
              if curr_roi.shape[0] >= ref_probe.shape[0] and curr_roi.shape[1] >= ref_probe.shape[1]:
                 res = cv2.matchTemplate(curr_roi, ref_probe, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(res)
@@ -147,14 +132,12 @@ def analyze_states_v31(df, fps):
     
     peaks, _ = find_peaks(x_mag, height=MOVE_THRESH, distance=fps*5)
     t_start, t_end = None, None
-    arrival_dir = 0 # +1 Right, -1 Left
+    arrival_dir = 0 
     
     if len(peaks) >= 2:
         arrival_idx = peaks[0]
         depart_idx = peaks[-1]
         
-        # Detect Direction from Arrival Flow
-        # Look at raw flow during arrival peak
         arr_flow = df['Flow_X_Sm'].iloc[arrival_idx]
         arrival_dir = 1 if arr_flow > 0 else -1
         
@@ -168,13 +151,6 @@ def analyze_states_v31(df, fps):
                 break
 
     # 2. CORNER MAPPING
-    # Mapping based on Arrival Direction (assuming Inside=Top, Outside=Bottom)
-    # If L->R: Front=Right, Rear=Left
-    # If R->L: Front=Left, Rear=Right
-    
-    # Default: L->R
-    # TL=Inside Rear, TR=Inside Front, BL=Outside Rear, BR=Outside Front
-    
     map_corners = {}
     if arrival_dir > 0: # Moving Right
         map_corners['Inside Rear'] = 'Act_TL_Sm'
@@ -191,12 +167,9 @@ def analyze_states_v31(df, fps):
     
     if t_start and t_end:
         stop_df = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
-        
-        # Calculate individual tire durations
-        # Logic: Time the activity is above a "Busy" threshold
         for name, col in map_corners.items():
             sig = stop_df[col]
-            thresh = sig.mean() + (sig.std() * 0.5) # Dynamic threshold
+            thresh = sig.mean() + (sig.std() * 0.5) 
             active = sig > thresh
             duration = active.sum() / fps
             corner_times[name] = duration
@@ -213,29 +186,20 @@ def analyze_states_v31(df, fps):
             z_vel = stop_window['Zoom_Vel'].values
             times = stop_window['Time'].values
             
-            # LIFT: First Expansion
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
                 t_up = times[peaks_up[0]]
             else:
                 t_up = t_start
                 
-            # DROP: Last "Snap" (Negative Velocity)
-            # We look for the *Deepest* negative velocity (Fastest drop)
-            # But we prioritize the *Last* one if there are multiple heavy drops
-            
-            mask_drop = times > t_up + 2.0 # Min 2s on jacks
+            mask_drop = times > t_up + 2.0 
             if np.any(mask_drop):
                 drop_vel = z_vel[mask_drop]
                 drop_times = times[mask_drop]
                 
-                # Find all significant snaps
-                # A snap is where velocity dips below -0.05
                 snap_indices = np.where(drop_vel < -0.05)[0]
                 
                 if len(snap_indices) > 0:
-                    # Pick the LAST significant snap
-                    # This handles the "Outside Front Done" wobble vs actual drop
                     last_snap_idx = snap_indices[-1]
                     t_down = drop_times[last_snap_idx]
                 else:
@@ -244,7 +208,9 @@ def analyze_states_v31(df, fps):
                 t_down = t_end
 
     # 4. FUEL
-    t_f_start, t_f_end = None, None
+    # FIX: Ensure variable names are consistent for return
+    t_fuel_start, t_fuel_end = None, None
+    
     if t_start and t_end:
         fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         matches = fuel_w['Probe_Match_Sm'].values
@@ -252,14 +218,14 @@ def analyze_states_v31(df, fps):
             active = matches > 0.55
             idx = np.where(active)[0]
             if len(idx) > fps:
-                t_f_start = fuel_w.iloc[idx[0]]['Time']
-                t_f_end = fuel_w.iloc[idx[-1]]['Time']
-                if t_f_end > t_end - 0.5: t_f_end = t_end - 0.5
+                t_fuel_start = fuel_w.iloc[idx[0]]['Time']
+                t_fuel_end = fuel_w.iloc[idx[-1]]['Time']
+                if t_fuel_end > t_end - 0.5: t_fuel_end = t_end - 0.5
 
-    # Fallbacks
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
+    # FIX: Returning the consistently named variables
     return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_times
 
 # --- PASS 3: Render ---
@@ -282,29 +248,24 @@ def render_overlay(input_path, pit, tires, fuel, corners, fps, width, height, pr
         curr = frame_idx / fps
         
         # --- TIMERS ---
-        # Pit
         if t_start and curr >= t_start:
             vp = (t_end - t_start) if (t_end and curr >= t_end) else (curr - t_start)
             cp = (0,0,255) if (t_end and curr >= t_end) else (0,255,0)
         else: vp, cp = 0.0, (200,200,200)
 
-        # Total Tires
         if t_up and curr >= t_up:
             vt = (t_down - t_up) if (t_down and curr >= t_down) else (curr - t_up)
             ct = (0,0,255) if (t_down and curr >= t_down) else (0,255,255)
         else: vt, ct = 0.0, (200,200,200)
 
-        # Fuel
         if t_f_start and curr >= t_f_start:
             vf = (t_f_end - t_f_start) if (t_f_end and curr >= t_f_end) else (curr - t_f_start)
             cf = (0,0,255) if (t_f_end and curr >= t_f_end) else (255,165,0)
         else: vf, cf = 0.0, (200,200,200)
         
         # --- UI DRAWING ---
-        # Main Box
         cv2.rectangle(frame, (width-450, 0), (width, 320), (0,0,0), -1)
         
-        # Main Stats
         cv2.putText(frame, "PIT STOP", (width-430, 40), 0, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{vp:.2f}s", (width-180, 40), 0, 1.2, cp, 3)
         
@@ -314,16 +275,11 @@ def render_overlay(input_path, pit, tires, fuel, corners, fps, width, height, pr
         cv2.putText(frame, "TIRES (Total)", (width-430, 140), 0, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{vt:.2f}s", (width-180, 140), 0, 1.2, ct, 3)
 
-        # Individual Tire Stats (Corner Matrix)
-        # Draw 2x2 grid visual
         start_y = 180
         gap_y = 30
-        # Order: IR, OF, OR, IF
         labels = ["Inside Rear", "Outside Front", "Outside Rear", "Inside Front"]
         for i, label in enumerate(labels):
             val = corners.get(label, 0.0)
-            # If total tire time is done, show final val, else show running or final
-            # Simplified: Just show the calculated duration constant
             txt_col = (200,200,200)
             if t_up and curr > t_up: txt_col = (255,255,255)
             
@@ -341,7 +297,7 @@ def render_overlay(input_path, pit, tires, fuel, corners, fps, width, height, pr
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V31")
+    st.title("🏁 Pit Stop Analyzer V31-FIX")
     st.markdown("### 4-Corner Tire Analysis")
     st.info("Detects individual tire activity zones and 'Total Jacks Time' based on the LAST drop event.")
 
@@ -394,8 +350,12 @@ def main():
         st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("Pit Stop Time", f"{pit_t[1] - pit_t[0]:.2f}s")
-        c2.metric("Fueling Time", f"{fuel_t[1] - fuel_t[0]:.2f}s" if fuel_t[0] else "N/A")
-        c3.metric("Tire Change Time", f"{tire_t[1] - tire_t[0]:.2f}s")
+        
+        f_dur = (fuel_t[1] - fuel_t[0]) if (fuel_t[0] and fuel_t[1]) else 0
+        c2.metric("Fueling Time", f"{f_dur:.2f}s" if f_dur > 0 else "N/A")
+        
+        t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
+        c3.metric("Tire Change Time", f"{t_dur:.2f}s")
         
         st.write("### 🛞 Tire Stats")
         t1, t2, t3, t4 = st.columns(4)
