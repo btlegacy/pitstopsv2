@@ -42,7 +42,7 @@ def extract_telemetry(video_path, progress_callback):
 
     telemetry_data = []
     
-    # Global ROI
+    # Global ROI (Center)
     g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
@@ -75,16 +75,15 @@ def extract_telemetry(video_path, progress_callback):
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         zoom_score = val_r - val_l
         
-        # 2. 4-CORNER ACTIVITY
-        # Top=Outside, Bottom=Inside
+        # 2. 4-CORNER ACTIVITY (Raw Magnitude Mean)
         h_roi, w_roi = curr_roi.shape
         mid_h, mid_w = h_roi // 2, w_roi // 2
         q_mag = mag 
         
-        act_tl = np.mean(q_mag[:mid_h, :mid_w]) # Top Left (Outside Rear/Front)
-        act_tr = np.mean(q_mag[:mid_h, mid_w:]) # Top Right
-        act_bl = np.mean(q_mag[mid_h:, :mid_w]) # Bottom Left (Inside Rear/Front)
-        act_br = np.mean(q_mag[mid_h:, mid_w:]) # Bottom Right
+        act_tl = np.mean(q_mag[:mid_h, :mid_w])
+        act_tr = np.mean(q_mag[:mid_h, mid_w:])
+        act_bl = np.mean(q_mag[mid_h:, :mid_w])
+        act_br = np.mean(q_mag[mid_h:, mid_w:])
         
         # 3. FUEL
         probe_score = 0.0
@@ -113,8 +112,39 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Multi-Tire Analysis ---
-def analyze_states_v32(df, fps):
+# --- Helper: Find Crossover ---
+def find_crossover_time(time_arr, sig1, sig2):
+    """
+    Finds the timestamp where activity shifts from Tire 1 (sig1) to Tire 2 (sig2).
+    """
+    # Find peaks
+    p1, _ = find_peaks(sig1, distance=10)
+    p2, _ = find_peaks(sig2, distance=10)
+    
+    if len(p1) == 0 or len(p2) == 0:
+        return time_arr[len(time_arr)//2] # Default middle
+
+    # Get main peaks
+    peak1 = p1[np.argmax(sig1[p1])]
+    peak2 = p2[np.argmax(sig2[p2])]
+    
+    # If peaks are in wrong order (e.g. 2nd tire peaks before 1st), 
+    # force split between them or default to 50%
+    if peak2 < peak1:
+        return time_arr[len(time_arr)//2]
+
+    # Ideally, find the 'valley' between the two peaks
+    # Slice between peaks
+    valley_segment = sig1[peak1:peak2] + sig2[peak1:peak2]
+    if len(valley_segment) > 0:
+        valley_local_idx = np.argmin(valley_segment)
+        split_idx = peak1 + valley_local_idx
+        return time_arr[split_idx]
+    else:
+        return time_arr[(peak1 + peak2) // 2]
+
+# --- PASS 2: Sequential Analysis ---
+def analyze_states_v33(df, fps):
     # Smoothing
     window = 15
     for col in ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']:
@@ -137,9 +167,8 @@ def analyze_states_v32(df, fps):
     if len(peaks) >= 2:
         arrival_idx = peaks[0]
         depart_idx = peaks[-1]
-        
         arr_flow = df['Flow_X_Sm'].iloc[arrival_idx]
-        arrival_dir = 1 if arr_flow > 0 else -1 # 1 = L->R
+        arrival_dir = 1 if arr_flow > 0 else -1 
         
         for i in range(arrival_idx, depart_idx):
             if x_mag.iloc[i] < STOP_THRESH:
@@ -152,7 +181,6 @@ def analyze_states_v32(df, fps):
 
     # 2. TOTAL TIRE CHANGE (Jacks)
     t_up, t_down = None, None
-    
     if t_start and t_end:
         t_creep = t_end - 1.0
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep)]
@@ -162,73 +190,93 @@ def analyze_states_v32(df, fps):
             z_vel = stop_window['Zoom_Vel'].values
             times = stop_window['Time'].values
             
-            # Lift
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
                 t_up = times[peaks_up[0]]
             else:
                 t_up = t_start
                 
-            # Drop (Max Velocity Snap)
-            # Look strictly after lift
             mask_drop = times > t_up + 2.0 
             if np.any(mask_drop):
                 drop_vel = z_vel[mask_drop]
                 drop_times = times[mask_drop]
-                
-                # Snap is Minimum Velocity (Fastest Contraction)
                 min_idx = np.argmin(drop_vel)
-                min_val = drop_vel[min_idx]
-                
-                # Threshold increased sensitivity (from -0.05 to -0.02)
-                # to catch softer drops
-                if min_val < -0.02: 
+                if drop_vel[min_idx] < -0.02: 
                     t_down = drop_times[min_idx]
                 else:
                     t_down = t_end
             else:
                 t_down = t_end
 
-    # 3. CORNER MAPPING & LIVE TIMERS
-    # Top = Outside, Bottom = Inside
+    # 3. CORNER MAPPING
+    # Top (T) = Outside, Bottom (B) = Inside
     map_corners = {}
-    
-    if arrival_dir > 0: # Moving Left to Right
-        # Front is Right, Rear is Left
-        map_corners['Inside Rear'] = 'Act_BL_Sm'   # Bottom Left
-        map_corners['Inside Front'] = 'Act_BR_Sm'  # Bottom Right
-        map_corners['Outside Rear'] = 'Act_TL_Sm'  # Top Left
-        map_corners['Outside Front'] = 'Act_TR_Sm' # Top Right
-    else: # Moving Right to Left
-        # Front is Left, Rear is Right
+    if arrival_dir > 0: # L->R
+        # Front=Right, Rear=Left
+        map_corners['Inside Rear'] = 'Act_BL_Sm'
+        map_corners['Inside Front'] = 'Act_BR_Sm'
+        map_corners['Outside Rear'] = 'Act_TL_Sm'
+        map_corners['Outside Front'] = 'Act_TR_Sm'
+    else: # R->L
         map_corners['Inside Rear'] = 'Act_BR_Sm'
         map_corners['Inside Front'] = 'Act_BL_Sm'
         map_corners['Outside Rear'] = 'Act_TR_Sm'
         map_corners['Outside Front'] = 'Act_TL_Sm'
-        
-    # Create Cumulative Timer Columns
-    if t_start and t_end:
-        # Define "Active" Threshold
-        for name, col in map_corners.items():
-            # Calculate dynamic threshold based on rest of video
-            sig = df[col]
-            # Activity must be above mean + slight noise margin
-            thresh = sig.mean() + (sig.std() * 0.2)
-            
-            # Create boolean mask: Is active AND within pit stop window?
-            is_working = (df[col] > thresh) & (df['Time'] >= t_start) & (df['Time'] <= t_end)
-            
-            # Create Cumulative Sum (seconds)
-            # Each frame is 1/fps seconds
-            df[f'Timer_{name}'] = is_working.cumsum() / fps
-    else:
-        # Init zero cols if failed
-        for name in map_corners.keys():
-            df[f'Timer_{name}'] = 0.0
 
-    # 4. FUEL
+    # 4. SEQUENTIAL TIMERS
+    # Init columns
+    for k in map_corners.keys():
+        df[f'Timer_{k}'] = 0.0
+        
+    if t_up and t_down:
+        # Work within the Jacks Window
+        mask_jacks = (df['Time'] >= t_up) & (df['Time'] <= t_down)
+        jacks_df = df[mask_jacks]
+        
+        if not jacks_df.empty:
+            time_arr = jacks_df['Time'].values
+            
+            # --- FRONT PAIR (Outside -> Inside) ---
+            sig_of = jacks_df[map_corners['Outside Front']].values
+            sig_if = jacks_df[map_corners['Inside Front']].values
+            
+            t_split_front = find_crossover_time(time_arr, sig_of, sig_if)
+            
+            # Calculate Timers based on Splits
+            # Outside Front: Active from Start -> Split
+            mask_of = (df['Time'] >= t_up) & (df['Time'] < t_split_front)
+            # Inside Front: Active from Split -> End
+            mask_if = (df['Time'] >= t_split_front) & (df['Time'] <= t_down)
+            
+            # --- REAR PAIR (Inside -> Outside) ---
+            sig_ir = jacks_df[map_corners['Inside Rear']].values
+            sig_or = jacks_df[map_corners['Outside Rear']].values
+            
+            t_split_rear = find_crossover_time(time_arr, sig_ir, sig_or)
+            
+            # Inside Rear: Active from Start -> Split
+            mask_ir = (df['Time'] >= t_up) & (df['Time'] < t_split_rear)
+            # Outside Rear: Active from Split -> End
+            mask_or = (df['Time'] >= t_split_rear) & (df['Time'] <= t_down)
+            
+            # Apply thresholds to masks to ensure we only count ACTUAL movement
+            # (This stops the timer from ticking if the guy is standing still)
+            for name, mask, active_mask in [
+                ('Outside Front', mask_of, sig_of),
+                ('Inside Front', mask_if, sig_if),
+                ('Inside Rear', mask_ir, sig_ir),
+                ('Outside Rear', mask_or, sig_or)
+            ]:
+                col_name = map_corners[name]
+                # Dynamic threshold for activity
+                sig_full = df[col_name]
+                thresh = sig_full.mean() + (sig_full.std() * 0.2)
+                
+                is_active = (df[col_name] > thresh) & mask
+                df[f'Timer_{name}'] = is_active.cumsum() / fps
+
+    # 5. FUEL
     t_fuel_start, t_fuel_end = None, None
-    
     if t_start and t_end:
         fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         matches = fuel_w['Probe_Match_Sm'].values
@@ -259,15 +307,15 @@ def render_overlay(input_path, pit, tires, fuel, df, fps, width, height, progres
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
     
-    # Labels order
-    labels = ["Inside Rear", "Outside Front", "Outside Rear", "Inside Front"]
+    # Display Order in Video
+    labels = ["Inside Rear", "Outside Rear", "Outside Front", "Inside Front"]
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
         curr = frame_idx / fps
         
-        # --- GLOBAL TIMERS ---
+        # Global Timers
         if t_start and curr >= t_start:
             vp = (t_end - t_start) if (t_end and curr >= t_end) else (curr - t_start)
             cp = (0,0,255) if (t_end and curr >= t_end) else (0,255,0)
@@ -283,7 +331,7 @@ def render_overlay(input_path, pit, tires, fuel, df, fps, width, height, progres
             cf = (0,0,255) if (t_f_end and curr >= t_f_end) else (255,165,0)
         else: vf, cf = 0.0, (200,200,200)
         
-        # --- UI DRAWING ---
+        # UI
         cv2.rectangle(frame, (width-450, 0), (width, 320), (0,0,0), -1)
         
         cv2.putText(frame, "PIT STOP", (width-430, 40), 0, 0.8, (255,255,255), 2)
@@ -295,11 +343,10 @@ def render_overlay(input_path, pit, tires, fuel, df, fps, width, height, progres
         cv2.putText(frame, "TIRES (Total)", (width-430, 140), 0, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{vt:.2f}s", (width-180, 140), 0, 1.2, ct, 3)
 
-        # --- LIVE CORNER TIMERS ---
+        # Sequential Tire Timers
         start_y = 180
         gap_y = 30
         
-        # Safe frame index access
         safe_idx = min(frame_idx, len(df) - 1)
         
         for i, label in enumerate(labels):
@@ -309,9 +356,8 @@ def render_overlay(input_path, pit, tires, fuel, df, fps, width, height, progres
             else:
                 val = 0.0
             
-            # Color logic: If value hasn't changed for 1 second, turn gray (done)
-            # For simplicity, just show white while stopwatch runs, gray if 0
-            txt_col = (255,255,255) if val > 0 else (150,150,150)
+            # Visual cue: Dim the ones that haven't started or are waiting
+            txt_col = (255,255,255) if val > 0 else (100,100,100)
             
             y_pos = start_y + (i*gap_y)
             cv2.putText(frame, label, (width-430, y_pos), 0, 0.6, txt_col, 1)
@@ -327,9 +373,9 @@ def render_overlay(input_path, pit, tires, fuel, df, fps, width, height, progres
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V32")
-    st.markdown("### Live Counters & Corrected Mapping")
-    st.info("Individual tire clocks now count up live. Fixed Inside/Outside mapping (Bottom=Inside).")
+    st.title("🏁 Pit Stop Analyzer V33")
+    st.markdown("### Sequential Tire Logic")
+    st.info("Enforces order: Outside Front -> Inside Front, and Inside Rear -> Outside Rear.")
 
     missing = []
     for r in ["probein"]:
@@ -353,8 +399,8 @@ def main():
             st.write("Step 1: Extraction (4-Corner Flow)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Analysis (Live Timers)...")
-            pit_t, tire_t, fuel_t, df_final = analyze_states_v32(df, fps)
+            st.write("Step 2: Analysis (Sequential Gating)...")
+            pit_t, tire_t, fuel_t, df_final = analyze_states_v33(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -394,7 +440,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v32.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v33.mp4")
 
 if __name__ == "__main__":
     main()
