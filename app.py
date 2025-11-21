@@ -112,12 +112,12 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- Helper: Sustain Logic ---
-def find_active_window(times, signal, start_gate, end_gate):
+# --- Helper: Work-Plateau Logic ---
+def find_active_window(times, signal, start_gate, end_gate, fps):
     """
-    Finds start and end of work.
-    Start: Needs High Threshold (30% of peak).
-    End: Needs Low Threshold (15% of peak) to catch 'leaving'.
+    Finds the 'Work Plateau'.
+    Start: Surges above 30% of peak range.
+    End: Drops below 25% of peak range AND STAYS THERE (Departure).
     """
     mask = (times >= start_gate) & (times <= end_gate)
     if not np.any(mask): return start_gate, start_gate
@@ -125,43 +125,46 @@ def find_active_window(times, signal, start_gate, end_gate):
     t_win = times[mask]
     s_win = signal[mask]
     
-    # Dynamic Thresholds based on Activity Range in this window
+    # 1. Determine Range
     baseline = np.percentile(s_win, 10) # Noise floor
-    peak = np.max(s_win)
+    peak_val = np.max(s_win)
+    dynamic_range = peak_val - baseline
     
-    # Safety: If signal is dead, return 0
-    if peak < 0.5: return start_gate, start_gate
+    if dynamic_range < 0.5: return start_gate, start_gate # No activity
 
-    thresh_start = baseline + (peak - baseline) * 0.30 # Strict start
-    thresh_end = baseline + (peak - baseline) * 0.15   # Lenient end (Sustain)
+    thresh_start = baseline + (dynamic_range * 0.30) # Needs strong start
+    thresh_end = baseline + (dynamic_range * 0.25)   # Needs to drop low to stop
     
-    # 1. Find Start (First crossing of High Thresh)
+    # 2. Find Start (First crossing)
     active_high = np.where(s_win > thresh_start)[0]
     if len(active_high) == 0: return start_gate, start_gate
     idx_start = active_high[0]
     
-    # 2. Find End (Last crossing of Low Thresh)
-    # Look for the last time the crew was active
-    active_low = np.where(s_win > thresh_end)[0]
+    # 3. Find End (Drop & Sustain)
+    # Search forward from the peak of activity
+    peak_idx = np.argmax(s_win)
     
-    # Constraint: End must be after Start
-    valid_ends = active_low[active_low > idx_start]
+    # If the start is after the peak (weird), start from start
+    search_start = max(idx_start, peak_idx)
+    idx_end = len(s_win) - 1 # Default to end of window
     
-    if len(valid_ends) > 0:
-        # Heuristic: Pick the last valid activity
-        idx_end = valid_ends[-1]
-        
-        # Trim: If there is a massive gap between activity clumps, stop at the first clump
-        # (This handles cases where crew returns to check something later)
-        # For simplicity, we stick to the last activity for now to satisfy "stops too soon".
-    else:
-        idx_end = idx_start + 1 
-        
+    # Look ahead buffer: 0.5 seconds
+    # If signal drops below thresh AND stays below for 0.5s, they have left.
+    buffer_frames = int(fps * 0.5)
+    
+    for i in range(search_start, len(s_win) - buffer_frames):
+        # Check current point
+        if s_win[i] < thresh_end:
+            # Check immediate future
+            future_segment = s_win[i : i + buffer_frames]
+            if np.mean(future_segment) < thresh_end:
+                idx_end = i
+                break
+    
     return t_win[idx_start], t_win[idx_end]
 
 # --- PASS 2: Analysis ---
-def analyze_states_v36(df, fps):
-    # Smoothing
+def analyze_states_v37(df, fps):
     window = 15
     for col in ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']:
         if len(df) > window:
@@ -195,7 +198,7 @@ def analyze_states_v36(df, fps):
                 t_end = df.iloc[i]['Time']
                 break
 
-    # 2. JACKS (Max Velocity Snap)
+    # 2. JACKS
     t_up, t_down = None, None
     if t_start and t_end:
         t_creep = t_end - 1.0
@@ -224,7 +227,7 @@ def analyze_states_v36(df, fps):
             else:
                 t_down = t_end
 
-    # 3. CORNER TIMING (Sustain Logic)
+    # 3. CORNER TIMING (V37 Work-Plateau)
     map_corners = {}
     if arrival_dir > 0: # L->R
         map_corners['Inside Rear'] = 'Act_BL_Sm'
@@ -240,40 +243,38 @@ def analyze_states_v36(df, fps):
     corner_stats = {}
     
     if t_up and t_down:
-        df_jacks = df[(df['Time'] >= t_up) & (df['Time'] <= t_down)]
+        # Analyze full window from Jacks Up to Departure
+        # We allow activity after Jacks Down because sometimes they finish as car drops
+        t_analysis_end = t_end 
+        df_jacks = df[(df['Time'] >= t_up) & (df['Time'] <= t_analysis_end)]
         times_j = df_jacks['Time'].values
         
-        # A. FRONT PAIR (Outside -> Inside)
+        # A. FRONT (OF -> IF)
         sig_of = df_jacks[map_corners['Outside Front']].values
         sig_if = df_jacks[map_corners['Inside Front']].values
         
-        # 1. Outside Front (OF)
-        # Gate: Can start anytime after Jacks Up
-        # End: Needs to sustain until crew leaves
-        t_of_start, t_of_end = find_active_window(times_j, sig_of, t_up, t_down)
+        # 1. Outside Front
+        t_of_start, t_of_end = find_active_window(times_j, sig_of, t_up, t_analysis_end, fps)
         
-        # 2. Inside Front (IF)
-        # Gate: Cannot start until OF has *Started* (plus buffer to move)
-        gate_if = t_of_start + 1.5 
-        t_if_start, t_if_end = find_active_window(times_j, sig_if, gate_if, t_down)
+        # 2. Inside Front (Starts after OF starts + buffer)
+        gate_if = t_of_start + 1.5
+        t_if_start, t_if_end = find_active_window(times_j, sig_if, gate_if, t_analysis_end, fps)
         
-        # Overwrite IF End to match Jacks Down (Front changer pulls jack)
-        if t_if_end > 0: t_if_end = t_down 
+        # Removed the hard lock to t_down. Now relies on activity drop.
         
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # B. REAR PAIR (Inside -> Outside)
+        # B. REAR (IR -> OR)
         sig_ir = df_jacks[map_corners['Inside Rear']].values
         sig_or = df_jacks[map_corners['Outside Rear']].values
         
-        # 3. Inside Rear (IR)
-        t_ir_start, t_ir_end = find_active_window(times_j, sig_ir, t_up, t_down)
+        # 3. Inside Rear
+        t_ir_start, t_ir_end = find_active_window(times_j, sig_ir, t_up, t_analysis_end, fps)
         
-        # 4. Outside Rear (OR)
-        # Gate: Cannot start until IR has Started
+        # 4. Outside Rear (Starts after IR starts + buffer)
         gate_or = t_ir_start + 1.5
-        t_or_start, t_or_end = find_active_window(times_j, sig_or, gate_or, t_down)
+        t_or_start, t_or_end = find_active_window(times_j, sig_or, gate_or, t_analysis_end, fps)
         
         corner_stats['Inside Rear'] = (t_ir_start, t_ir_end)
         corner_stats['Outside Rear'] = (t_or_start, t_or_end)
@@ -375,9 +376,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, fps, width, height
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V36")
-    st.markdown("### Sustain-Based Timing")
-    st.info("Counters keep running as long as quadrant activity is sustained. Fixes early stop.")
+    st.title("🏁 Pit Stop Analyzer V37")
+    st.markdown("### Work-Plateau Logic")
+    st.info("Stops tire clocks when activity drops below 25% of peak and sustains that drop (Departure Confirmation).")
 
     missing = []
     for r in ["probein"]:
@@ -398,11 +399,11 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction...")
+            st.write("Step 1: Extraction (4-Corner Flow)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Analysis (Sustain Logic)...")
-            pit_t, tire_t, fuel_t, corners = analyze_states_v36(df, fps)
+            st.write("Step 2: Analysis (Work Plateau Detection)...")
+            pit_t, tire_t, fuel_t, corners = analyze_states_v37(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -454,7 +455,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v36.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v37.mp4")
 
 if __name__ == "__main__":
     main()
