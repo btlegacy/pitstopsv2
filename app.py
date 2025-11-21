@@ -27,7 +27,7 @@ def load_ref_image(folder_name):
         return cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
     return None
 
-# --- PASS 1: 4-Corner Extraction ---
+# --- PASS 1: 4-Corner Extraction (Directional) ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -42,7 +42,6 @@ def extract_telemetry(video_path, progress_callback):
 
     telemetry_data = []
     
-    # Global ROI
     g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
@@ -63,8 +62,9 @@ def extract_telemetry(video_path, progress_callback):
         # 1. Optical Flow
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         fx = flow[..., 0]
+        fy = flow[..., 1] # Capture Y flow
         
-        mag = np.sqrt(fx**2 + flow[..., 1]**2)
+        mag = np.sqrt(fx**2 + fy**2)
         active = mag > 1.0 
         flow_x = np.median(fx[active]) if np.any(active) else 0.0
         
@@ -75,15 +75,24 @@ def extract_telemetry(video_path, progress_callback):
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         zoom_score = val_r - val_l
         
-        # 2. 4-CORNER ACTIVITY
+        # 2. 4-CORNER METRICS (Activity + Vertical Flow)
         h_roi, w_roi = curr_roi.shape
         mid_h, mid_w = h_roi // 2, w_roi // 2
-        q_mag = mag 
         
+        # Magnitude (Activity)
+        q_mag = mag 
         act_tl = np.mean(q_mag[:mid_h, :mid_w])
         act_tr = np.mean(q_mag[:mid_h, mid_w:])
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
+        
+        # Vertical Flow (For Hand Raise Detection)
+        # We calculate the mean Y-flow in each quadrant
+        q_fy = fy
+        fy_tl = np.mean(q_fy[:mid_h, :mid_w])
+        fy_tr = np.mean(q_fy[:mid_h, mid_w:])
+        fy_bl = np.mean(q_fy[mid_h:, :mid_w])
+        fy_br = np.mean(q_fy[mid_h:, mid_w:])
         
         # 3. FUEL
         probe_score = 0.0
@@ -99,10 +108,10 @@ def extract_telemetry(video_path, progress_callback):
             "Flow_X": flow_x,
             "Zoom_Score": zoom_score,
             "Probe_Match": probe_score,
-            "Act_TL": act_tl,
-            "Act_TR": act_tr,
-            "Act_BL": act_bl,
-            "Act_BR": act_br
+            "Act_TL": act_tl, "Fy_TL": fy_tl,
+            "Act_TR": act_tr, "Fy_TR": fy_tr,
+            "Act_BL": act_bl, "Fy_BL": fy_bl,
+            "Act_BR": act_br, "Fy_BR": fy_br
         })
         
         prev_roi = curr_roi
@@ -148,10 +157,15 @@ def find_active_window(times, signal, start_gate, end_gate, fps):
     
     return t_win[idx_start], t_win[idx_end]
 
-# --- PASS 2: Analysis V38 (Strict Rear Handover) ---
-def analyze_states_v38(df, fps):
+# --- PASS 2: Analysis ---
+def analyze_states_v39(df, fps):
+    # Smoothing
     window = 15
-    for col in ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']:
+    cols_to_smooth = ['Flow_X', 'Zoom_Score', 'Probe_Match', 
+                      'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR',
+                      'Fy_TL', 'Fy_TR', 'Fy_BL', 'Fy_BR']
+                      
+    for col in cols_to_smooth:
         if len(df) > window:
             df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
         else:
@@ -212,18 +226,20 @@ def analyze_states_v38(df, fps):
             else:
                 t_down = t_end
 
-    # 3. CORNER TIMING (Strict Handover)
-    map_corners = {}
+    # 3. CORNER TIMING (With Hand Raise Detection)
+    map_act = {} # Activity Magnitude
+    map_fy = {}  # Vertical Flow (For Gestures)
+    
     if arrival_dir > 0: # L->R
-        map_corners['Inside Rear'] = 'Act_BL_Sm'
-        map_corners['Inside Front'] = 'Act_BR_Sm'
-        map_corners['Outside Rear'] = 'Act_TL_Sm'
-        map_corners['Outside Front'] = 'Act_TR_Sm'
+        map_act['Inside Rear'] = 'Act_BL_Sm'; map_fy['Inside Rear'] = 'Fy_BL_Sm'
+        map_act['Inside Front'] = 'Act_BR_Sm'; map_fy['Inside Front'] = 'Fy_BR_Sm'
+        map_act['Outside Rear'] = 'Act_TL_Sm'; map_fy['Outside Rear'] = 'Fy_TL_Sm'
+        map_act['Outside Front'] = 'Act_TR_Sm'; map_fy['Outside Front'] = 'Fy_TR_Sm'
     else: 
-        map_corners['Inside Rear'] = 'Act_BR_Sm'
-        map_corners['Inside Front'] = 'Act_BL_Sm'
-        map_corners['Outside Rear'] = 'Act_TR_Sm'
-        map_corners['Outside Front'] = 'Act_TL_Sm'
+        map_act['Inside Rear'] = 'Act_BR_Sm'; map_fy['Inside Rear'] = 'Fy_BR_Sm'
+        map_act['Inside Front'] = 'Act_BL_Sm'; map_fy['Inside Front'] = 'Fy_BL_Sm'
+        map_act['Outside Rear'] = 'Act_TR_Sm'; map_fy['Outside Rear'] = 'Fy_TR_Sm'
+        map_act['Outside Front'] = 'Act_TL_Sm'; map_fy['Outside Front'] = 'Fy_TL_Sm'
 
     corner_stats = {}
     
@@ -233,32 +249,58 @@ def analyze_states_v38(df, fps):
         times_j = df_jacks['Time'].values
         
         # A. FRONT (OF -> IF)
-        sig_of = df_jacks[map_corners['Outside Front']].values
-        sig_if = df_jacks[map_corners['Inside Front']].values
+        sig_of = df_jacks[map_act['Outside Front']].values
+        sig_if = df_jacks[map_act['Inside Front']].values
         
         t_of_start, t_of_end = find_active_window(times_j, sig_of, t_up, t_analysis_end, fps)
+        
         gate_if = t_of_start + 1.5
         t_if_start, t_if_end = find_active_window(times_j, sig_if, gate_if, t_analysis_end, fps)
         
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # B. REAR (IR -> OR) - Strict Handover Logic
-        sig_ir = df_jacks[map_corners['Inside Rear']].values
-        sig_or = df_jacks[map_corners['Outside Rear']].values
+        # B. REAR (IR -> OR)
+        sig_ir = df_jacks[map_act['Inside Rear']].values
+        sig_or = df_jacks[map_act['Outside Rear']].values
         
-        # 1. Calculate IR normally first
         t_ir_start, t_ir_raw_end = find_active_window(times_j, sig_ir, t_up, t_analysis_end, fps)
         
-        # 2. Calculate OR (Must start after IR started)
         gate_or = t_ir_start + 2.0
-        t_or_start, t_or_end = find_active_window(times_j, sig_or, gate_or, t_analysis_end, fps)
+        t_or_start, t_or_raw_end = find_active_window(times_j, sig_or, gate_or, t_analysis_end, fps)
         
-        # 3. STRICT HANDOVER: IR Stops exactly when OR Starts
+        # STRICT HANDOVER
         if t_or_start > t_ir_start:
             t_ir_end = t_or_start
         else:
-            t_ir_end = t_ir_raw_end # Fallback if OR detection failed
+            t_ir_end = t_ir_raw_end
+            
+        # --- OUTSIDE REAR HAND RAISE LOGIC ---
+        # Look for Negative Y-Flow (Upward motion) near the end of the activity window
+        # Search from 1s before raw end to 2s after
+        t_search_start = t_or_raw_end - 1.5
+        t_search_end = t_or_raw_end + 2.0
+        
+        or_fy_col = map_fy['Outside Rear']
+        mask_hr = (df['Time'] >= t_search_start) & (df['Time'] <= t_search_end)
+        
+        if np.any(mask_hr):
+            fy_segment = df.loc[mask_hr, or_fy_col].values
+            t_segment = df.loc[mask_hr, 'Time'].values
+            
+            # Hand Raise = Sharp Negative Spike in Fy (Moving Up)
+            # Find minimum (most negative) peak
+            peaks, _ = find_peaks(-fy_segment, height=0.5, distance=fps) # Height 0.5px/frame
+            
+            if len(peaks) > 0:
+                # Pick the first significant upward motion in this departure window
+                t_hand_raise = t_segment[peaks[0]]
+                t_or_end = t_hand_raise
+            else:
+                # Fallback: If no hand raise detected, stick to activity drop
+                t_or_end = t_or_raw_end
+        else:
+            t_or_end = t_or_raw_end
         
         corner_stats['Inside Rear'] = (t_ir_start, t_ir_end)
         corner_stats['Outside Rear'] = (t_or_start, t_or_end)
@@ -360,9 +402,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, fps, width, height
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V38")
-    st.markdown("### Strict Rear Handover")
-    st.info("Rear tire logic enforced: **Inside Rear End** = **Outside Rear Start**.")
+    st.title("🏁 Pit Stop Analyzer V39")
+    st.markdown("### Hand Raise Detection")
+    st.info("Stops **Outside Rear** clock when it detects a vertical 'Hand Raise' gesture (Upward Flow) after work is done.")
 
     missing = []
     for r in ["probein"]:
@@ -383,11 +425,11 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (4-Corner Flow)...")
+            st.write("Step 1: Extraction (Directional Flow)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Analysis (Strict Handover)...")
-            pit_t, tire_t, fuel_t, corners = analyze_states_v38(df, fps)
+            st.write("Step 2: Analysis (Hand Raise Logic)...")
+            pit_t, tire_t, fuel_t, corners = analyze_states_v39(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -439,7 +481,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v38.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v39.mp4")
 
 if __name__ == "__main__":
     main()
