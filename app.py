@@ -41,12 +41,11 @@ def extract_telemetry(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Load Templates
     temps_in = load_templates("probein")
     
     telemetry_data = []
     
-    # Optical Flow ROI
+    # ROI
     g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
@@ -63,21 +62,21 @@ def extract_telemetry(video_path, progress_callback):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         curr_roi = gray[g_y1:g_y2, g_x1:g_x2]
         
-        # 1. Optical Flow
+        # 1. Flow
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         fx = flow[..., 0]
         mag = np.sqrt(fx**2 + flow[..., 1]**2)
         active = mag > 1.0 
         flow_x = np.median(fx[active]) if np.any(active) else 0.0
         
-        # Zoom
+        # 2. Zoom
         f_left = fx[:, :mid_x]
         f_right = fx[:, mid_x:]
         val_l = np.median(f_left[np.abs(f_left)>0.5]) if np.any(np.abs(f_left)>0.5) else 0.0
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         zoom_score = val_r - val_l
         
-        # 2. 4-CORNER
+        # 3. 4-Corner
         h_roi, w_roi = curr_roi.shape
         mid_h, mid_w = h_roi // 2, w_roi // 2
         q_mag = mag 
@@ -86,7 +85,7 @@ def extract_telemetry(video_path, progress_callback):
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
-        # 3. FUEL (Wide Search)
+        # 4. Fuel (Wide Search)
         score_in = 0.0
         fuel_box = None 
         
@@ -94,7 +93,6 @@ def extract_telemetry(video_path, progress_callback):
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
             valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9]
-            
             if valid_indices:
                 valid_boxes = boxes[valid_indices]
                 largest_idx = np.argmax(valid_boxes[:, 2] * valid_boxes[:, 3])
@@ -112,7 +110,6 @@ def extract_telemetry(video_path, progress_callback):
                 if (x2 > x1) and (y2 > y1):
                     fuel_zone = gray[y1:y2, x1:x2]
                     fuel_box = (x1, y1, x2-x1, y2-y1)
-                    
                     for t in temps_in:
                         if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
                             res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
@@ -137,10 +134,44 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis ---
-def analyze_states_v42(df, fps):
+# --- Helper: Active Window ---
+def find_active_window(times, signal, start_gate, end_gate, fps):
+    mask = (times >= start_gate) & (times <= end_gate)
+    if not np.any(mask): return start_gate, start_gate
+    
+    t_win = times[mask]
+    s_win = signal[mask]
+    
+    baseline = np.percentile(s_win, 10)
+    peak_val = np.max(s_win)
+    dynamic_range = peak_val - baseline
+    if dynamic_range < 0.5: return start_gate, start_gate
+
+    thresh_start = baseline + (dynamic_range * 0.30)
+    thresh_end = baseline + (dynamic_range * 0.25)
+    
+    active_high = np.where(s_win > thresh_start)[0]
+    if len(active_high) == 0: return start_gate, start_gate
+    idx_start = active_high[0]
+    
+    # Find End
+    peak_idx = np.argmax(s_win)
+    search_start = max(idx_start, peak_idx)
+    idx_end = len(s_win) - 1
+    
+    buffer_frames = int(fps * 0.5)
+    for i in range(search_start, len(s_win) - buffer_frames):
+        if s_win[i] < thresh_end:
+            future_segment = s_win[i : i + buffer_frames]
+            if np.mean(future_segment) < thresh_end:
+                idx_end = i
+                break
+    
+    return t_win[idx_start], t_win[idx_end]
+
+# --- PASS 2: Analysis V43 ---
+def analyze_states_v43(df, fps):
     window = 15
-    # Smooth columns and create new _Sm versions
     cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
     for col in cols:
         if len(df) > window:
@@ -201,32 +232,7 @@ def analyze_states_v42(df, fps):
             else:
                 t_down = t_end
 
-    # 3. CORNER TIMING
-    def get_window(sig, start_g, end_g):
-        mask = (df['Time'] >= start_g) & (df['Time'] <= end_g)
-        if not np.any(mask): return start_g, start_g
-        s_win = sig[mask]
-        t_win = df['Time'][mask].values
-        base = np.percentile(s_win, 10)
-        peak = np.max(s_win)
-        if (peak-base) < 0.5: return start_g, start_g
-        
-        t_s = base + (peak-base)*0.3
-        t_e = base + (peak-base)*0.25
-        
-        high = np.where(s_win > t_s)[0]
-        if len(high) == 0: return start_g, start_g
-        i_start = high[0]
-        
-        search_s = max(i_start, np.argmax(s_win))
-        i_end = len(s_win) - 1
-        buf = int(fps * 0.5)
-        for i in range(search_s, len(s_win)-buf):
-            if s_win[i] < t_e and np.mean(s_win[i:i+buf]) < t_e:
-                i_end = i
-                break
-        return t_win[i_start], t_win[i_end]
-
+    # 3. CORNER TIMING (Cross-Check Logic)
     map_corners = {}
     if arrival_dir > 0: 
         map_corners['Inside Rear'] = 'Act_BL_Sm'; map_corners['Outside Rear'] = 'Act_TL_Sm'
@@ -238,42 +244,66 @@ def analyze_states_v42(df, fps):
     corner_stats = {}
     if t_up and t_down:
         t_ae = t_end
-        of = df[map_corners['Outside Front']].values
-        if_ = df[map_corners['Inside Front']].values
-        ts_of, te_of = get_window(of, t_up, t_ae)
-        ts_if, te_if = get_window(if_, ts_of+1.5, t_ae)
+        # Jacks Window
+        df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
+        times_j = df_j['Time'].values
+        
+        # A. FRONT
+        of = df_j[map_corners['Outside Front']].values
+        if_ = df_j[map_corners['Inside Front']].values
+        ts_of, te_of = find_active_window(times_j, of, t_up, t_ae, fps)
+        ts_if, te_if = find_active_window(times_j, if_, ts_of+1.5, t_ae, fps)
         corner_stats['Outside Front'] = (ts_of, te_of)
         corner_stats['Inside Front'] = (ts_if, te_if)
         
-        ir = df[map_corners['Inside Rear']].values
-        or_ = df[map_corners['Outside Rear']].values
-        ts_ir, te_ir = get_window(ir, t_up, t_ae)
-        ts_or, te_or = get_window(or_, ts_ir+1.5, t_ae)
+        # B. REAR (Cross-Check Fix)
+        ir = df_j[map_corners['Inside Rear']].values
+        or_ = df_j[map_corners['Outside Rear']].values
+        
+        # 1. Calculate Outside Rear First (It's cleaner - no fueler)
+        # It can only start after a reasonable gap from Jacks Up
+        ts_or, te_or = find_active_window(times_j, or_, t_up + 3.0, t_ae, fps)
+        
+        # 2. Calculate Inside Rear Start normally
+        ts_ir, te_ir_raw = find_active_window(times_j, ir, t_up, t_ae, fps)
+        
+        # 3. FORCE IR END based on OR Start
+        # The tire changer cannot be in two places. 
+        # If OR starts at X, IR *must* have ended at X minus Transit Time (~1.5s)
+        # We ignore the 'raw' end because that's likely the fueler staying behind.
+        
+        if ts_or > ts_ir:
+            # Transit time assumption: 1.5s
+            transit_time = 1.5
+            te_ir_forced = ts_or - transit_time
+            
+            # Safety: Don't make it negative length
+            if te_ir_forced < ts_ir + 2.0:
+                te_ir = ts_ir + 2.0 # Min duration
+            else:
+                te_ir = te_ir_forced
+        else:
+            # Fallback if OR detection failed
+            te_ir = te_ir_raw
+            
         corner_stats['Inside Rear'] = (ts_ir, te_ir)
         corner_stats['Outside Rear'] = (ts_or, te_or)
 
     # 4. FUEL
     t_fuel_start, t_fuel_end = None, None
-    
     if t_start and t_end:
         fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not fuel_w.empty:
             s_in = fuel_w['S_In_Sm'].values
             times = fuel_w['Time'].values
-            
             is_fueling = s_in > 0.50
             indices = np.where(is_fueling)[0]
-            
             if len(indices) > int(fps * 2.0): 
                 t_fuel_start = times[indices[0]]
-                
                 diffs = np.diff(indices)
                 splits = np.where(diffs > 20)[0]
-                if len(splits) > 0:
-                    end_idx = indices[splits[0]]
-                else:
-                    end_idx = indices[-1]
-                    
+                if len(splits) > 0: end_idx = indices[splits[0]]
+                else: end_idx = indices[-1]
                 t_fuel_end = times[end_idx]
                 if t_fuel_end > t_end - 0.5: t_fuel_end = t_end - 0.5
 
@@ -341,7 +371,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
             cv2.putText(frame, label, (width-430, y_pos), 0, 0.6, txt_col, 1)
             cv2.putText(frame, f"{c_val:.1f}s", (width-100, y_pos), 0, 0.6, txt_col, 2)
 
-        # Debug Overlay
+        # Debug
         if show_debug:
             safe_idx = min(frame_idx, len(df)-1)
             row = df.iloc[safe_idx]
@@ -362,9 +392,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V42-FIX")
-    st.markdown("### Fixed Chart Column Name")
-    st.info("Fuel logic relaxed: Threshold 0.50, Min Duration 2.0s. Search Area: Full Car.")
+    st.title("🏁 Pit Stop Analyzer V43")
+    st.markdown("### Cross-Check Logic")
+    st.info("Inside Rear Timer now cuts off automatically when Outside Rear activity starts (minus transit time). Ignores fueler.")
 
     show_debug = st.sidebar.checkbox("Show Fuel Debug Overlay", value=False)
 
@@ -391,7 +421,7 @@ def main():
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners = analyze_states_v42(df, fps)
+            pit_t, tire_t, fuel_t, corners = analyze_states_v43(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -424,14 +454,17 @@ def main():
         t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
         c3.metric("Tire Change Time", f"{t_dur:.2f}s")
         
-        st.subheader("📊 Telemetry")
-        base = alt.Chart(df).encode(x='Time')
+        st.write("### 🛞 Tire Stats")
+        t1, t2, t3, t4 = st.columns(4)
         
-        fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(y=alt.Y('S_In_Sm', title='Fuel Score (In)'))
-        # CORRECTED: Zoom_Score_Sm
-        zoom_chart = base.mark_line(color='magenta').encode(y=alt.Y('Zoom_Score_Sm', title='Zoom'))
-        
-        st.altair_chart((fuel_chart + zoom_chart).interactive(), use_container_width=True)
+        def get_dur(k):
+            s, e = corners.get(k, (0,0))
+            return e - s
+
+        t1.metric("Inside Rear", f"{get_dur('Inside Rear'):.2f}s")
+        t2.metric("Outside Front", f"{get_dur('Outside Front'):.2f}s")
+        t3.metric("Outside Rear", f"{get_dur('Outside Rear'):.2f}s")
+        t4.metric("Inside Front", f"{get_dur('Inside Front'):.2f}s")
         
         st.subheader("Video Result")
         c1, c2 = st.columns([3,1])
@@ -440,7 +473,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v42.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v43.mp4")
 
 if __name__ == "__main__":
     main()
