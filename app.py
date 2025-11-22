@@ -88,19 +88,18 @@ def extract_telemetry(video_path, progress_callback):
         
         # 3. FUEL (Wide Search)
         score_in = 0.0
-        fuel_box = None # For debug
+        fuel_box = None 
         
         results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
-            valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9] # Ignore wall
+            valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9]
             
             if valid_indices:
                 valid_boxes = boxes[valid_indices]
                 largest_idx = np.argmax(valid_boxes[:, 2] * valid_boxes[:, 3])
                 cx, cy, cw, ch = valid_boxes[largest_idx]
                 
-                # V42 Change: Search FULL car box (plus margin)
                 margin = 20
                 x1 = int(cx - cw/2) - margin
                 y1 = int(cy - ch/2) - margin
@@ -114,7 +113,6 @@ def extract_telemetry(video_path, progress_callback):
                     fuel_zone = gray[y1:y2, x1:x2]
                     fuel_box = (x1, y1, x2-x1, y2-y1)
                     
-                    # Match all 'Probe In' templates
                     for t in temps_in:
                         if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
                             res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
@@ -127,7 +125,7 @@ def extract_telemetry(video_path, progress_callback):
             "Flow_X": flow_x,
             "Zoom_Score": zoom_score,
             "S_In": score_in,
-            "Fuel_Box": fuel_box, # Save for debug render
+            "Fuel_Box": fuel_box, 
             "Act_TL": act_tl, "Act_TR": act_tr,
             "Act_BL": act_bl, "Act_BR": act_br
         })
@@ -142,6 +140,7 @@ def extract_telemetry(video_path, progress_callback):
 # --- PASS 2: Analysis ---
 def analyze_states_v42(df, fps):
     window = 15
+    # Smooth columns and create new _Sm versions
     cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
     for col in cols:
         if len(df) > window:
@@ -253,7 +252,7 @@ def analyze_states_v42(df, fps):
         corner_stats['Inside Rear'] = (ts_ir, te_ir)
         corner_stats['Outside Rear'] = (ts_or, te_or)
 
-    # 4. FUEL (Lowered Threshold & Persistence)
+    # 4. FUEL
     t_fuel_start, t_fuel_end = None, None
     
     if t_start and t_end:
@@ -262,19 +261,14 @@ def analyze_states_v42(df, fps):
             s_in = fuel_w['S_In_Sm'].values
             times = fuel_w['Time'].values
             
-            # V42: Lower Threshold to 0.5 (50% match)
-            # V42: Must sustain for > 2.0 seconds
-            
             is_fueling = s_in > 0.50
             indices = np.where(is_fueling)[0]
             
             if len(indices) > int(fps * 2.0): 
                 t_fuel_start = times[indices[0]]
                 
-                # Robust End finding: Allow short dropouts (e.g. 20 frames)
                 diffs = np.diff(indices)
                 splits = np.where(diffs > 20)[0]
-                
                 if len(splits) > 0:
                     end_idx = indices[splits[0]]
                 else:
@@ -347,18 +341,14 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
             cv2.putText(frame, label, (width-430, y_pos), 0, 0.6, txt_col, 1)
             cv2.putText(frame, f"{c_val:.1f}s", (width-100, y_pos), 0, 0.6, txt_col, 2)
 
-        # V42 DEBUG OVERLAY
+        # Debug Overlay
         if show_debug:
             safe_idx = min(frame_idx, len(df)-1)
             row = df.iloc[safe_idx]
-            
-            # Show search box
             fb = row['Fuel_Box']
             if fb is not None:
                 x, y, w, h = fb
                 cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
-                
-            # Show Score
             sc = row['S_In_Sm']
             cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 290), 0, 0.6, (0, 255, 255), 2)
 
@@ -372,8 +362,8 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V42")
-    st.markdown("### Debug & Tuning")
+    st.title("🏁 Pit Stop Analyzer V42-FIX")
+    st.markdown("### Fixed Chart Column Name")
     st.info("Fuel logic relaxed: Threshold 0.50, Min Duration 2.0s. Search Area: Full Car.")
 
     show_debug = st.sidebar.checkbox("Show Fuel Debug Overlay", value=False)
@@ -438,7 +428,8 @@ def main():
         base = alt.Chart(df).encode(x='Time')
         
         fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(y=alt.Y('S_In_Sm', title='Fuel Score (In)'))
-        zoom_chart = base.mark_line(color='magenta').encode(y=alt.Y('Zoom_Smooth', title='Zoom'))
+        # CORRECTED: Zoom_Score_Sm
+        zoom_chart = base.mark_line(color='magenta').encode(y=alt.Y('Zoom_Score_Sm', title='Zoom'))
         
         st.altair_chart((fuel_chart + zoom_chart).interactive(), use_container_width=True)
         
