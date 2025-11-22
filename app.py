@@ -17,29 +17,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def load_model():
     return YOLO('yolov8n.pt')
 
-def load_templates(folder_name, specific_file=None):
-    """
-    Loads a list of grayscale templates from a folder or specific file.
-    """
+def load_templates(folder_name):
     templates = []
-    if specific_file:
-        # Load specific single file
-        path = os.path.join(BASE_DIR, "refs", folder_name, specific_file)
-        if os.path.exists(path):
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if img is not None: templates.append(img)
-    else:
-        # Load all images in folder
-        path = os.path.join(BASE_DIR, "refs", folder_name, "*")
+    path = os.path.join(BASE_DIR, "refs", folder_name, "*")
+    files = glob.glob(path)
+    if not files:
+        path = os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
         files = glob.glob(path)
-        for f in files:
-            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-                if img is not None: templates.append(img)
-                
+    for f in files:
+        if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+            img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+            if img is not None: templates.append(img)
     return templates
 
-# --- PASS 1: Extraction (Multi-Template) ---
+# --- PASS 1: Extraction ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -50,14 +41,9 @@ def extract_telemetry(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # --- LOAD REFERENCES ---
-    # 1. Probe In (The "Fueling" State)
+    # Load Templates
     temps_in = load_templates("probein")
-    # 2. Probe Out (The "Hovering" State)
-    temps_out = load_templates("probeout")
-    # 3. Empty Port (The "Idle" State)
-    temps_empty = load_templates("emptyfuelport", "emptyfuelport.png")
-
+    
     telemetry_data = []
     
     # Optical Flow ROI
@@ -65,11 +51,10 @@ def extract_telemetry(video_path, progress_callback):
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
     
+    frame_idx = 0
     ret, prev_frame = cap.read()
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     prev_roi = prev_gray[g_y1:g_y2, g_x1:g_x2]
-    
-    frame_idx = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -92,7 +77,7 @@ def extract_telemetry(video_path, progress_callback):
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         zoom_score = val_r - val_l
         
-        # 2. 4-CORNER ACTIVITY
+        # 2. 4-CORNER
         h_roi, w_roi = curr_roi.shape
         mid_h, mid_w = h_roi // 2, w_roi // 2
         q_mag = mag 
@@ -101,58 +86,40 @@ def extract_telemetry(video_path, progress_callback):
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
-        # 3. FUEL DETECTION (Multi-State)
+        # 3. FUEL (Wide Search)
         score_in = 0.0
-        score_out = 0.0
-        score_empty = 0.0
+        fuel_box = None # For debug
         
-        # YOLO to find Car
         results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
-        
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
-            valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9]
+            valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9] # Ignore wall
             
             if valid_indices:
                 valid_boxes = boxes[valid_indices]
                 largest_idx = np.argmax(valid_boxes[:, 2] * valid_boxes[:, 3])
                 cx, cy, cw, ch = valid_boxes[largest_idx]
                 
-                # Fuel ROI: Bottom Half (Inside) of Car
-                x1 = int(cx - cw/2)
-                x2 = int(cx + cw/2)
-                y1 = int(cy) 
-                y2 = int(cy + ch/2)
+                # V42 Change: Search FULL car box (plus margin)
+                margin = 20
+                x1 = int(cx - cw/2) - margin
+                y1 = int(cy - ch/2) - margin
+                x2 = int(cx + cw/2) + margin
+                y2 = int(cy + ch/2) + margin
                 
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(width, x2), min(height, y2)
                 
                 if (x2 > x1) and (y2 > y1):
                     fuel_zone = gray[y1:y2, x1:x2]
+                    fuel_box = (x1, y1, x2-x1, y2-y1)
                     
-                    # Run Matches for ALL templates
-                    # We take the MAX score for each category
-                    
-                    # A. PROBE IN
+                    # Match all 'Probe In' templates
                     for t in temps_in:
                         if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
                             res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
                             _, max_val, _, _ = cv2.minMaxLoc(res)
                             if max_val > score_in: score_in = max_val
-                            
-                    # B. PROBE OUT
-                    for t in temps_out:
-                        if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
-                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
-                            _, max_val, _, _ = cv2.minMaxLoc(res)
-                            if max_val > score_out: score_out = max_val
-                            
-                    # C. EMPTY
-                    for t in temps_empty:
-                        if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
-                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
-                            _, max_val, _, _ = cv2.minMaxLoc(res)
-                            if max_val > score_empty: score_empty = max_val
 
         telemetry_data.append({
             "Frame": frame_idx,
@@ -160,8 +127,7 @@ def extract_telemetry(video_path, progress_callback):
             "Flow_X": flow_x,
             "Zoom_Score": zoom_score,
             "S_In": score_in,
-            "S_Out": score_out,
-            "S_Empty": score_empty,
+            "Fuel_Box": fuel_box, # Save for debug render
             "Act_TL": act_tl, "Act_TR": act_tr,
             "Act_BL": act_bl, "Act_BR": act_br
         })
@@ -173,11 +139,10 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V41 ---
-def analyze_states_v41(df, fps):
-    # Smoothing
+# --- PASS 2: Analysis ---
+def analyze_states_v42(df, fps):
     window = 15
-    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'S_Out', 'S_Empty', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
+    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
     for col in cols:
         if len(df) > window:
             df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
@@ -238,7 +203,6 @@ def analyze_states_v41(df, fps):
                 t_down = t_end
 
     # 3. CORNER TIMING
-    # Helper for active window
     def get_window(sig, start_g, end_g):
         mask = (df['Time'] >= start_g) & (df['Time'] <= end_g)
         if not np.any(mask): return start_g, start_g
@@ -275,8 +239,6 @@ def analyze_states_v41(df, fps):
     corner_stats = {}
     if t_up and t_down:
         t_ae = t_end
-        
-        # Front
         of = df[map_corners['Outside Front']].values
         if_ = df[map_corners['Inside Front']].values
         ts_of, te_of = get_window(of, t_up, t_ae)
@@ -284,7 +246,6 @@ def analyze_states_v41(df, fps):
         corner_stats['Outside Front'] = (ts_of, te_of)
         corner_stats['Inside Front'] = (ts_if, te_if)
         
-        # Rear
         ir = df[map_corners['Inside Rear']].values
         or_ = df[map_corners['Outside Rear']].values
         ts_ir, te_ir = get_window(ir, t_up, t_ae)
@@ -292,36 +253,29 @@ def analyze_states_v41(df, fps):
         corner_stats['Inside Rear'] = (ts_ir, te_ir)
         corner_stats['Outside Rear'] = (ts_or, te_or)
 
-    # 4. FUEL (Multi-State Logic)
+    # 4. FUEL (Lowered Threshold & Persistence)
     t_fuel_start, t_fuel_end = None, None
     
     if t_start and t_end:
         fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not fuel_w.empty:
             s_in = fuel_w['S_In_Sm'].values
-            s_out = fuel_w['S_Out_Sm'].values
-            s_empty = fuel_w['S_Empty_Sm'].values
             times = fuel_w['Time'].values
             
-            # Definition: Fueling is ACTIVE if "In" score is high AND dominant
-            # 1. In > 0.65 (High Confidence)
-            # 2. In > Out (Looks more like In than Out)
-            # 3. In > Empty (Looks more like In than Empty)
+            # V42: Lower Threshold to 0.5 (50% match)
+            # V42: Must sustain for > 2.0 seconds
             
-            is_fueling = (s_in > 0.65) & (s_in > s_out) & (s_in > s_empty)
-            
+            is_fueling = s_in > 0.50
             indices = np.where(is_fueling)[0]
             
-            if len(indices) > fps: # Sustain for 1s
+            if len(indices) > int(fps * 2.0): 
                 t_fuel_start = times[indices[0]]
                 
-                # Find End: When condition breaks
-                # Gap filling: allow 10 frames of drop
+                # Robust End finding: Allow short dropouts (e.g. 20 frames)
                 diffs = np.diff(indices)
-                splits = np.where(diffs > 10)[0]
+                splits = np.where(diffs > 20)[0]
+                
                 if len(splits) > 0:
-                    # If multiple blocks, assume the big one is fueling
-                    # Or take start->end of first block
                     end_idx = indices[splits[0]]
                 else:
                     end_idx = indices[-1]
@@ -335,7 +289,7 @@ def analyze_states_v41(df, fps):
     return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats
 
 # --- PASS 3: Render ---
-def render_overlay(input_path, pit, tires, fuel, corner_data, fps, width, height, progress_callback):
+def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, height, show_debug, progress_callback):
     cap = cv2.VideoCapture(input_path)
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
@@ -354,7 +308,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, fps, width, height
         if not ret: break
         curr = frame_idx / fps
         
-        # Global Timers
+        # Timers
         if t_start and curr >= t_start:
             vp = (t_end - t_start) if (t_end and curr >= t_end) else (curr - t_start)
             cp = (0,0,255) if (t_end and curr >= t_end) else (0,255,0)
@@ -393,6 +347,21 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, fps, width, height
             cv2.putText(frame, label, (width-430, y_pos), 0, 0.6, txt_col, 1)
             cv2.putText(frame, f"{c_val:.1f}s", (width-100, y_pos), 0, 0.6, txt_col, 2)
 
+        # V42 DEBUG OVERLAY
+        if show_debug:
+            safe_idx = min(frame_idx, len(df)-1)
+            row = df.iloc[safe_idx]
+            
+            # Show search box
+            fb = row['Fuel_Box']
+            if fb is not None:
+                x, y, w, h = fb
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                
+            # Show Score
+            sc = row['S_In_Sm']
+            cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 290), 0, 0.6, (0, 255, 255), 2)
+
         out.write(frame)
         frame_idx += 1
         if frame_idx % 50 == 0: progress_callback(frame_idx / total_frames)
@@ -403,9 +372,11 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, fps, width, height
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V41")
-    st.markdown("### Multi-State Fuel Detection")
-    st.info("Uses 'Probe In' vs 'Probe Out' comparison. Fueling starts when In > Out & In > Empty.")
+    st.title("🏁 Pit Stop Analyzer V42")
+    st.markdown("### Debug & Tuning")
+    st.info("Fuel logic relaxed: Threshold 0.50, Min Duration 2.0s. Search Area: Full Car.")
+
+    show_debug = st.sidebar.checkbox("Show Fuel Debug Overlay", value=False)
 
     missing = []
     for r in ["probein", "probeout", "emptyfuelport"]:
@@ -430,13 +401,13 @@ def main():
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners = analyze_states_v41(df, fps)
+            pit_t, tire_t, fuel_t, corners = analyze_states_v42(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
             else:
                 st.write("Step 3: Rendering Video...")
-                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, fps, w, h, bar.progress)
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, df, fps, w, h, show_debug, bar.progress)
                 
                 st.session_state.update({
                     'df': df, 'video_path': vid_path, 
@@ -463,17 +434,13 @@ def main():
         t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
         c3.metric("Tire Change Time", f"{t_dur:.2f}s")
         
-        st.write("### 🛞 Tire Stats")
-        t1, t2, t3, t4 = st.columns(4)
+        st.subheader("📊 Telemetry")
+        base = alt.Chart(df).encode(x='Time')
         
-        def get_dur(k):
-            s, e = corners.get(k, (0,0))
-            return e - s
-
-        t1.metric("Inside Rear", f"{get_dur('Inside Rear'):.2f}s")
-        t2.metric("Outside Front", f"{get_dur('Outside Front'):.2f}s")
-        t3.metric("Outside Rear", f"{get_dur('Outside Rear'):.2f}s")
-        t4.metric("Inside Front", f"{get_dur('Inside Front'):.2f}s")
+        fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(y=alt.Y('S_In_Sm', title='Fuel Score (In)'))
+        zoom_chart = base.mark_line(color='magenta').encode(y=alt.Y('Zoom_Smooth', title='Zoom'))
+        
+        st.altair_chart((fuel_chart + zoom_chart).interactive(), use_container_width=True)
         
         st.subheader("Video Result")
         c1, c2 = st.columns([3,1])
@@ -482,7 +449,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v41.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v42.mp4")
 
 if __name__ == "__main__":
     main()
