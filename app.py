@@ -178,7 +178,6 @@ def analyze_states_v47(df, fps):
         df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
         times_j = df_j['Time'].values
         
-        # Sensitivity Tuned Window Finder
         def get_window(sig, start_g, end_g, sens):
             mask = (times_j >= start_g) & (times_j <= end_g)
             if not np.any(mask): return start_g, start_g
@@ -188,10 +187,7 @@ def analyze_states_v47(df, fps):
             peak = np.max(s_win)
             if peak < 0.5: return start_g, start_g
             
-            # Start Trigger: Base + (Range * Sensitivity)
-            # Higher Sensitivity = Later Start (Needs more action)
             t_s = base + (peak-base) * sens
-            # End Trigger: Base + (Range * 0.20) - Standard
             t_e = base + (peak-base) * 0.20
             
             active = np.where(s_win > t_s)[0]
@@ -211,7 +207,6 @@ def analyze_states_v47(df, fps):
         # A. FRONT
         sig_of = df_j[map_corners['Outside Front']].values
         sig_if = df_j[map_corners['Inside Front']].values
-        # Standard Sens (0.3) for Front
         t_of_start, t_of_end = get_window(sig_of, t_up, t_ae, 0.3)
         t_if_start, t_if_end = get_window(sig_if, t_of_start+1.5, t_ae, 0.3)
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
@@ -222,27 +217,16 @@ def analyze_states_v47(df, fps):
         sig_or = df_j[map_corners['Outside Rear']].values
         
         # 1. Outside Rear (OR) - HIGH SENSITIVITY (0.55)
-        # Require 55% of peak activity to trigger start. 
-        # This skips the "walking in" phase and waits for "gun on".
         t_or_start, t_or_end = get_window(sig_or, t_up + 2.5, t_ae, sens=0.55)
         
         # 2. Inside Rear (IR) - LOW SENSITIVITY (0.15)
-        # Catch the very first movement
         t_ir_start, t_ir_raw_end = get_window(sig_ir, t_up, t_ae, sens=0.15)
         
         # 3. Force Transition
-        # Transition = gap between IR End and OR Start
-        # If OR starts late (due to high threshold), transition extends automatically
-        
         if t_or_start > t_up + 3.0:
-            # Force IR end relative to OR start if needed, but respect the gap
-            # The gap IS the transition.
-            
-            # Logic check: Did IR signal end naturally before OR start?
             if t_ir_raw_end < t_or_start:
                 t_ir_end = t_ir_raw_end
             else:
-                # Overlap detected - Cut IR 1.0s before OR starts (assumed transit min)
                 t_ir_end = t_or_start - 1.0
                 if t_ir_end < t_ir_start + 1.5: t_ir_end = t_ir_start + 1.5
             
@@ -355,8 +339,8 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
         if show_debug:
             safe_idx = min(frame_idx, len(df)-1)
             row = df.iloc[safe_idx]
-            sc = row['S_In_Sm']
-            cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 310), 0, 0.5, (0, 255, 255), 1)
+            sc = row['Probe_Match_Sm'] # Fixed column name
+            cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
 
         out.write(frame)
         frame_idx += 1
@@ -368,9 +352,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V47")
+    st.title("🏁 Pit Stop Analyzer V47-Fixed")
     st.markdown("### Gun-On Detection Logic")
-    st.info("Uses High Intensity Threshold (55%) for Outside Rear to skip walking time and detect actual gun work.")
+    st.info("Uses High Intensity Threshold (55%) for Outside Rear to skip walking time.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
