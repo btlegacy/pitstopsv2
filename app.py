@@ -107,8 +107,8 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V47 (Gun-On Logic) ---
-def analyze_states_v47(df, fps):
+# --- PASS 2: Analysis V48 (Energy Cliff) ---
+def analyze_states_v48(df, fps):
     window = 15
     for col in ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']:
         if len(df) > window:
@@ -204,7 +204,7 @@ def analyze_states_v47(df, fps):
                     break
             return t_win[i_start], t_win[i_end]
 
-        # A. FRONT
+        # A. FRONT (Standard)
         sig_of = df_j[map_corners['Outside Front']].values
         sig_if = df_j[map_corners['Inside Front']].values
         t_of_start, t_of_end = get_window(sig_of, t_up, t_ae, 0.3)
@@ -212,29 +212,48 @@ def analyze_states_v47(df, fps):
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # B. REAR (Gun-On Logic)
+        # B. REAR (Energy Cliff Logic)
         sig_ir = df_j[map_corners['Inside Rear']].values
         sig_or = df_j[map_corners['Outside Rear']].values
         
-        # 1. Outside Rear (OR) - HIGH SENSITIVITY (0.55)
+        # 1. Outside Rear (OR) - High Threshold
         t_or_start, t_or_end = get_window(sig_or, t_up + 2.5, t_ae, sens=0.55)
         
-        # 2. Inside Rear (IR) - LOW SENSITIVITY (0.15)
-        t_ir_start, t_ir_raw_end = get_window(sig_ir, t_up, t_ae, sens=0.15)
+        # 2. Inside Rear (IR) - Sensitive Start, Cliff End
+        # Start: Very sensitive (0.15)
+        t_ir_start, _ = get_window(sig_ir, t_up, t_ae, sens=0.15)
         
-        # 3. Force Transition
-        if t_or_start > t_up + 3.0:
-            if t_ir_raw_end < t_or_start:
-                t_ir_end = t_ir_raw_end
-            else:
-                t_ir_end = t_or_start - 1.0
-                if t_ir_end < t_ir_start + 1.5: t_ir_end = t_ir_start + 1.5
+        # End: Energy Cliff Detection
+        # Search from IR Start -> OR Start
+        search_end = t_or_start if t_or_start > t_ir_start + 2.0 else t_ae
+        
+        mask_cliff = (times_j >= t_ir_start + 2.0) & (times_j <= search_end)
+        if np.any(mask_cliff):
+            sig_cliff = sig_ir[mask_cliff]
+            t_cliff = times_j[mask_cliff]
             
-            t_trans_start = t_ir_end
-            t_trans_end = t_or_start
+            # Calculate Derivative (Rate of Change)
+            grad = np.gradient(sig_cliff)
+            
+            # Find the sharpest DROP (Negative Peak in Gradient)
+            # This represents the moment activity crashes (Gun comes off)
+            min_grad_idx = np.argmin(grad)
+            min_grad_val = grad[min_grad_idx]
+            
+            # If drop is sharp enough, mark it
+            if min_grad_val < -0.2: # Threshold for "Stopping Work"
+                t_ir_end = t_cliff[min_grad_idx]
+            else:
+                t_ir_end = t_or_start # Fallback to transition point
         else:
-            t_ir_end = t_ir_raw_end
-            t_trans_start, t_trans_end = t_ir_end, t_ir_end
+            t_ir_end = t_or_start
+
+        # Calculate Transition
+        if t_or_start > t_ir_end:
+            t_trans_start, t_trans_end = t_ir_end, t_or_start
+        else:
+            t_ir_end = t_or_start - 1.0 if t_or_start > t_ir_start + 2.0 else t_ir_start + 2.0
+            t_trans_start, t_trans_end = t_ir_end, t_or_start
             
         corner_stats['Inside Rear'] = (t_ir_start, t_ir_end)
         corner_stats['Rear Transition'] = (t_trans_start, t_trans_end)
@@ -339,7 +358,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
         if show_debug:
             safe_idx = min(frame_idx, len(df)-1)
             row = df.iloc[safe_idx]
-            sc = row['Probe_Match_Sm'] # Fixed column name
+            sc = row['Probe_Match_Sm']
             cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
 
         out.write(frame)
@@ -352,9 +371,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V47-Fixed")
-    st.markdown("### Gun-On Detection Logic")
-    st.info("Uses High Intensity Threshold (55%) for Outside Rear to skip walking time.")
+    st.title("🏁 Pit Stop Analyzer V48")
+    st.markdown("### Energy Cliff Detection")
+    st.info("Detects sharp drop in Inside Rear activity to identify work completion, separating tire changer from fueler.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -381,7 +400,7 @@ def main():
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners = analyze_states_v47(df, fps)
+            pit_t, tire_t, fuel_t, corners = analyze_states_v48(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -429,7 +448,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v47.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v48.mp4")
 
 if __name__ == "__main__":
     main()
