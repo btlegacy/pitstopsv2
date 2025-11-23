@@ -107,8 +107,8 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V46 (Forced Transition) ---
-def analyze_states_v46(df, fps):
+# --- PASS 2: Analysis V47 (Gun-On Logic) ---
+def analyze_states_v47(df, fps):
     window = 15
     for col in ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']:
         if len(df) > window:
@@ -178,8 +178,8 @@ def analyze_states_v46(df, fps):
         df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
         times_j = df_j['Time'].values
         
-        # General Window Finder (Enhanced Sensitivity)
-        def get_window(sig, start_g, end_g, sens=0.3):
+        # Sensitivity Tuned Window Finder
+        def get_window(sig, start_g, end_g, sens):
             mask = (times_j >= start_g) & (times_j <= end_g)
             if not np.any(mask): return start_g, start_g
             s_win = sig[mask]
@@ -188,8 +188,10 @@ def analyze_states_v46(df, fps):
             peak = np.max(s_win)
             if peak < 0.5: return start_g, start_g
             
-            # V46: Lower start threshold (sens)
+            # Start Trigger: Base + (Range * Sensitivity)
+            # Higher Sensitivity = Later Start (Needs more action)
             t_s = base + (peak-base) * sens
+            # End Trigger: Base + (Range * 0.20) - Standard
             t_e = base + (peak-base) * 0.20
             
             active = np.where(s_win > t_s)[0]
@@ -206,43 +208,44 @@ def analyze_states_v46(df, fps):
                     break
             return t_win[i_start], t_win[i_end]
 
-        # A. FRONT (Unchanged)
+        # A. FRONT
         sig_of = df_j[map_corners['Outside Front']].values
         sig_if = df_j[map_corners['Inside Front']].values
-        t_of_start, t_of_end = get_window(sig_of, t_up, t_ae)
-        t_if_start, t_if_end = get_window(sig_if, t_of_start+1.5, t_ae)
+        # Standard Sens (0.3) for Front
+        t_of_start, t_of_end = get_window(sig_of, t_up, t_ae, 0.3)
+        t_if_start, t_if_end = get_window(sig_if, t_of_start+1.5, t_ae, 0.3)
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # B. REAR (Forced Transition)
+        # B. REAR (Gun-On Logic)
         sig_ir = df_j[map_corners['Inside Rear']].values
         sig_or = df_j[map_corners['Outside Rear']].values
         
-        # 1. Find Outside Rear (OR) - Usually clean
-        t_or_start, t_or_end = get_window(sig_or, t_up + 2.5, t_ae)
+        # 1. Outside Rear (OR) - HIGH SENSITIVITY (0.55)
+        # Require 55% of peak activity to trigger start. 
+        # This skips the "walking in" phase and waits for "gun on".
+        t_or_start, t_or_end = get_window(sig_or, t_up + 2.5, t_ae, sens=0.55)
         
-        # 2. Find Inside Rear (IR) - High Sensitivity
-        # Start threshold 0.15 (Very sensitive to catch early movement)
+        # 2. Inside Rear (IR) - LOW SENSITIVITY (0.15)
+        # Catch the very first movement
         t_ir_start, t_ir_raw_end = get_window(sig_ir, t_up, t_ae, sens=0.15)
         
-        # 3. Force Transition Logic
-        # IF OR started, IR MUST have ended before it.
-        # We force a minimum 1.0s transition time if the data is messy (fueler overlap)
+        # 3. Force Transition
+        # Transition = gap between IR End and OR Start
+        # If OR starts late (due to high threshold), transition extends automatically
         
-        if t_or_start > t_up + 3.0: # If OR exists and is valid
-            min_transition = 1.0
-            t_ir_max_end = t_or_start - min_transition
+        if t_or_start > t_up + 3.0:
+            # Force IR end relative to OR start if needed, but respect the gap
+            # The gap IS the transition.
             
-            if t_ir_raw_end > t_ir_max_end:
-                # Data says IR ended late (likely fueler). Force it back.
-                t_ir_end = t_ir_max_end
-                # Safety: Ensure it doesn't end before it starts
-                if t_ir_end < t_ir_start + 2.0: t_ir_end = t_ir_start + 2.0
-            else:
-                # Data looks okay, use it
+            # Logic check: Did IR signal end naturally before OR start?
+            if t_ir_raw_end < t_or_start:
                 t_ir_end = t_ir_raw_end
-                
-            # Transition is the gap
+            else:
+                # Overlap detected - Cut IR 1.0s before OR starts (assumed transit min)
+                t_ir_end = t_or_start - 1.0
+                if t_ir_end < t_ir_start + 1.5: t_ir_end = t_ir_start + 1.5
+            
             t_trans_start = t_ir_end
             t_trans_end = t_or_start
         else:
@@ -287,6 +290,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
     
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
+    labels = ["Inside Rear", "Outside Rear", "Outside Front", "Inside Front"]
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -310,7 +314,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
         else: vf, cf = 0.0, (200,200,200)
         
         # UI
-        cv2.rectangle(frame, (width-450, 0), (width, 320), (0,0,0), -1)
+        cv2.rectangle(frame, (width-450, 0), (width, 360), (0,0,0), -1)
         cv2.putText(frame, "PIT STOP", (width-430, 40), 0, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{vp:.2f}s", (width-180, 40), 0, 1.2, cp, 3)
         cv2.putText(frame, "FUELING", (width-430, 90), 0, 0.8, (255,255,255), 2)
@@ -318,10 +322,8 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
         cv2.putText(frame, "TIRES (Total)", (width-430, 140), 0, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{vt:.2f}s", (width-180, 140), 0, 1.2, ct, 3)
 
-        # Corners
         start_y = 180
         gap_y = 30
-        
         trans_start, trans_end = corner_data.get("Rear Transition", (0,0))
         
         labels_ui = [
@@ -334,7 +336,6 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
         
         for i, (key, display) in enumerate(labels_ui):
             y_pos = start_y + (i*gap_y)
-            
             if key == "TRANSITION":
                 c_start, c_end = trans_start, trans_end
                 label_col = (255, 255, 0)
@@ -367,9 +368,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V46")
-    st.markdown("### Forced Transition Logic")
-    st.info("Inside Rear is highly sensitive (Start threshold 15%). End of IR is forced if overlap with Outside Rear occurs.")
+    st.title("🏁 Pit Stop Analyzer V47")
+    st.markdown("### Gun-On Detection Logic")
+    st.info("Uses High Intensity Threshold (55%) for Outside Rear to skip walking time and detect actual gun work.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -396,7 +397,7 @@ def main():
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners = analyze_states_v46(df, fps)
+            pit_t, tire_t, fuel_t, corners = analyze_states_v47(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -444,7 +445,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v46.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v47.mp4")
 
 if __name__ == "__main__":
     main()
