@@ -78,7 +78,6 @@ def extract_telemetry(video_path, progress_callback):
         zoom_score = val_r - val_l
         
         # 3. 6-ZONE GRID ACTIVITY
-        # Split ROI into 2 Rows (Inside/Outside) x 3 Cols (Rear/Mid/Front)
         h_roi, w_roi = curr_roi.shape
         row_h = h_roi // 2
         col_w = w_roi // 3
@@ -147,7 +146,7 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V56 (6-Zone Logic) ---
+# --- PASS 2: Analysis V56 (Fixed) ---
 def analyze_states_v56(df, fps):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TC', 'Act_TR', 'Act_BL', 'Act_BC', 'Act_BR']
@@ -203,20 +202,14 @@ def analyze_states_v56(df, fps):
                 else: t_down = t_end
             else: t_down = t_end
 
-    # 3. CORNER TIMING (6-Zone Mapping)
+    # 3. CORNER TIMING (6-Zone)
     map_corners = {}
     if arrival_dir > 0: # L->R
-        # Front=Right, Rear=Left. Outside=Top, Inside=Bottom.
-        # Rear Zones: TL (Outside), BL (Inside)
-        # Front Zones: TR (Outside), BR (Inside)
         map_corners['Inside Rear'] = 'Act_BL_Sm'
         map_corners['Outside Rear'] = 'Act_TL_Sm'
         map_corners['Inside Front'] = 'Act_BR_Sm'
         map_corners['Outside Front'] = 'Act_TR_Sm'
     else: # R->L
-        # Front=Left, Rear=Right.
-        # Rear Zones: TR (Outside), BR (Inside)
-        # Front Zones: TL (Outside), BL (Inside)
         map_corners['Inside Rear'] = 'Act_BR_Sm'
         map_corners['Outside Rear'] = 'Act_TR_Sm'
         map_corners['Inside Front'] = 'Act_BL_Sm'
@@ -254,7 +247,7 @@ def analyze_states_v56(df, fps):
                     break
             return t_win[i_start], t_win[i_end]
         
-        # A. FRONT (Standard)
+        # A. FRONT
         of = df_j[map_corners['Outside Front']].values
         if_ = df_j[map_corners['Inside Front']].values
         ts_of, te_of = get_window(of, t_up, t_ae, 0.3)
@@ -262,29 +255,25 @@ def analyze_states_v56(df, fps):
         corner_stats['Outside Front'] = (ts_of, te_of)
         corner_stats['Inside Front'] = (ts_if, te_if)
         
-        # B. REAR (6-Zone Separation)
+        # B. REAR
         ir = df_j[map_corners['Inside Rear']].values
         or_ = df_j[map_corners['Outside Rear']].values
         
-        # 1. Outside Rear (Gun Spike - 0.55 Sens)
+        # 1. Outside Rear (Gun Spike)
         ts_or, te_or = get_window(or_, t_up+2.5, t_ae, 0.55)
         
-        # 2. Inside Rear (Sensitive Start, Cliff End)
-        # Because the Fueler is in the "Center" zone now, the "Inside Rear" zone 
-        # should show a clean drop when the tire changer leaves.
-        
-        # Find Start
+        # 2. Inside Rear Start
         ts_ir, te_ir_raw = get_window(ir, t_up, t_ae, 0.15)
         
-        # Find End: Look for Energy Cliff
-        # Search between Peak and OR Start
+        # 3. Inside Rear End (Cliff Detection)
         search_s = ts_ir + 1.0
         search_e = ts_or
         
         if search_e > search_s:
             mask_c = (df['Time'] >= search_s) & (df['Time'] <= search_e)
             if np.any(mask_c):
-                sig_c = df.loc[mask_c, map_corners['Inside Rear'] + '_Sm'].values
+                # FIX: Access the column correctly (it already has _Sm suffix)
+                sig_c = df.loc[mask_c, map_corners['Inside Rear']].values
                 time_c = df.loc[mask_c, 'Time'].values
                 grad = np.gradient(sig_c)
                 min_grad_idx = np.argmin(grad)
@@ -298,10 +287,8 @@ def analyze_states_v56(df, fps):
         else:
              te_ir = te_ir_raw
         
-        # Safety: IR End cannot be > OR Start
-        if te_ir > ts_or: 
-            te_ir = ts_or - 0.5 # Minimum transition gap
-            
+        if te_ir > ts_or: te_ir = ts_or - 0.5
+        
         corner_stats['Inside Rear'] = (ts_ir, te_ir)
         corner_stats['Rear Transition'] = (te_ir, ts_or)
         corner_stats['Outside Rear'] = (ts_or, te_or)
@@ -423,9 +410,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V56")
-    st.markdown("### 6-Zone Grid Logic")
-    st.info("Splits detection into 6 zones (Rear/Mid/Front x In/Out). Isolate Fueler in 'Inside-Center' from 'Inside-Rear'.")
+    st.title("🏁 Pit Stop Analyzer V56-FIX")
+    st.markdown("### 6-Zone Grid Logic (Fixed)")
+    st.info("Corrected column access for Energy Cliff detection. Analyzes Inside Rear independent of Fueler.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
