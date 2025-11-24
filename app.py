@@ -30,7 +30,7 @@ def load_templates(folder_name):
             if img is not None: templates.append(img)
     return templates
 
-# --- PASS 1: Extraction ---
+# --- PASS 1: Extraction (6-Zone Grid) ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -45,9 +45,9 @@ def extract_telemetry(video_path, progress_callback):
     
     telemetry_data = []
     
-    g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
+    # Global ROI (Center)
+    g_x1, g_x2 = int(width * 0.10), int(width * 0.90)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
-    mid_x = int((g_x2 - g_x1) / 2)
     
     ret, prev_frame = cap.read()
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
@@ -62,36 +62,38 @@ def extract_telemetry(video_path, progress_callback):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         curr_roi = gray[g_y1:g_y2, g_x1:g_x2]
         
-        # 1. Flow
+        # 1. Optical Flow
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         fx = flow[..., 0]
-        fy = flow[..., 1]
-        mag = np.sqrt(fx**2 + fy**2)
+        mag = np.sqrt(fx**2 + flow[..., 1]**2)
         active = mag > 1.0 
         flow_x = np.median(fx[active]) if np.any(active) else 0.0
         
-        # 2. Zoom
-        f_left = fx[:, :mid_x]
-        f_right = fx[:, mid_x:]
+        # 2. Zoom (Left vs Right split of ROI)
+        mid_x_roi = curr_roi.shape[1] // 2
+        f_left = fx[:, :mid_x_roi]
+        f_right = fx[:, mid_x_roi:]
         val_l = np.median(f_left[np.abs(f_left)>0.5]) if np.any(np.abs(f_left)>0.5) else 0.0
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         zoom_score = val_r - val_l
         
-        # 3. 4-Corner
+        # 3. 6-ZONE GRID ACTIVITY
+        # Split ROI into 2 Rows (Inside/Outside) x 3 Cols (Rear/Mid/Front)
         h_roi, w_roi = curr_roi.shape
-        mid_h, mid_w = h_roi // 2, w_roi // 2
-        q_mag = mag 
-        act_tl = np.mean(q_mag[:mid_h, :mid_w])
-        act_tr = np.mean(q_mag[:mid_h, mid_w:])
-        act_bl = np.mean(q_mag[mid_h:, :mid_w])
-        act_br = np.mean(q_mag[mid_h:, mid_w:])
+        row_h = h_roi // 2
+        col_w = w_roi // 3
         
-        # Vertical Flow per corner (Direction)
-        q_fy = fy
-        fy_tl = np.mean(q_fy[:mid_h, :mid_w])
-        fy_tr = np.mean(q_fy[:mid_h, mid_w:])
-        fy_bl = np.mean(q_fy[mid_h:, :mid_w])
-        fy_br = np.mean(q_fy[mid_h:, mid_w:])
+        q_mag = mag 
+        
+        # Top Row (Outside)
+        act_tl = np.mean(q_mag[:row_h, :col_w])           # Top Left
+        act_tc = np.mean(q_mag[:row_h, col_w:2*col_w])    # Top Center
+        act_tr = np.mean(q_mag[:row_h, 2*col_w:])         # Top Right
+        
+        # Bottom Row (Inside)
+        act_bl = np.mean(q_mag[row_h:, :col_w])           # Bottom Left
+        act_bc = np.mean(q_mag[row_h:, col_w:2*col_w])    # Bottom Center
+        act_br = np.mean(q_mag[row_h:, 2*col_w:])         # Bottom Right
         
         # 4. Fuel
         score_in = 0.0
@@ -107,10 +109,11 @@ def extract_telemetry(video_path, progress_callback):
                 largest_idx = np.argmax(valid_boxes[:, 2] * valid_boxes[:, 3])
                 cx, cy, cw, ch = valid_boxes[largest_idx]
                 
+                # Fuel Search: Center Bottom of Car
                 margin = 20
-                x1 = int(cx - cw/2) - margin
-                y1 = int(cy - ch/2) - margin
-                x2 = int(cx + cw/2) + margin
+                x1 = int(cx - cw/4) # Narrower width focus
+                x2 = int(cx + cw/4)
+                y1 = int(cy)
                 y2 = int(cy + ch/2) + margin
                 
                 x1, y1 = max(0, x1), max(0, y1)
@@ -133,10 +136,8 @@ def extract_telemetry(video_path, progress_callback):
             "Zoom_Score": zoom_score,
             "S_In": score_in,
             "Fuel_Box": fuel_box, 
-            "Act_TL": act_tl, "Act_TR": act_tr,
-            "Act_BL": act_bl, "Act_BR": act_br,
-            "Fy_TL": fy_tl, "Fy_TR": fy_tr, 
-            "Fy_BL": fy_bl, "Fy_BR": fy_br
+            "Act_TL": act_tl, "Act_TC": act_tc, "Act_TR": act_tr,
+            "Act_BL": act_bl, "Act_BC": act_bc, "Act_BR": act_br
         })
         
         prev_roi = curr_roi
@@ -146,19 +147,15 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V53 (Gun-Spike Logic) ---
-def analyze_states_v53(df, fps):
+# --- PASS 2: Analysis V56 (6-Zone Logic) ---
+def analyze_states_v56(df, fps):
     window = 15
-    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR',
-            'Fy_TL', 'Fy_TR', 'Fy_BL', 'Fy_BR']
+    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TC', 'Act_TR', 'Act_BL', 'Act_BC', 'Act_BR']
     for col in cols:
-        if col in df.columns:
-            if len(df) > window:
-                df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
-            else:
-                df[f'{col}_Sm'] = df[col]
+        if len(df) > window:
+            df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
         else:
-            df[f'{col}_Sm'] = 0.0
+            df[f'{col}_Sm'] = df[col]
 
     df['Zoom_Vel'] = np.gradient(df['Zoom_Score_Sm'])
 
@@ -174,13 +171,12 @@ def analyze_states_v53(df, fps):
         arr_flow = df['Flow_X_Sm'].iloc[arrival_idx]
         arrival_dir = 1 if arr_flow > 0 else -1 
         
-        STOP_THRESH = x_mag.max() * 0.05
         for i in range(arrival_idx, depart_idx):
-            if x_mag.iloc[i] < STOP_THRESH:
+            if x_mag.iloc[i] < x_mag.max()*0.05:
                 t_start = df.iloc[i]['Time']
                 break
         for i in range(depart_idx, arrival_idx, -1):
-            if x_mag.iloc[i] < STOP_THRESH:
+            if x_mag.iloc[i] < x_mag.max()*0.05:
                 t_end = df.iloc[i]['Time']
                 break
 
@@ -189,7 +185,6 @@ def analyze_states_v53(df, fps):
     if t_start and t_end:
         t_creep = t_end - 1.0
         stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep)]
-        
         if not stop_window.empty:
             z_pos = stop_window['Zoom_Score_Sm'].values
             z_vel = stop_window['Zoom_Vel'].values
@@ -208,123 +203,105 @@ def analyze_states_v53(df, fps):
                 else: t_down = t_end
             else: t_down = t_end
 
-    # 3. CORNER TIMING
-    def get_window(sig, start_g, end_g, sens):
-        mask = (df['Time'] >= start_g) & (df['Time'] <= end_g)
-        if not np.any(mask): return start_g, start_g
-        s_win = sig[mask]
-        t_win = df['Time'][mask].values
-        base = np.percentile(s_win, 10)
-        peak = np.max(s_win)
-        if peak < 0.5: return start_g, start_g
-        
-        t_s = base + (peak-base) * sens
-        t_e = base + (peak-base) * 0.20
-        
-        active = np.where(s_win > t_s)[0]
-        if len(active) == 0: return start_g, start_g
-        i_start = active[0]
-        
-        peak_idx = np.argmax(s_win)
-        search_s = max(i_start, peak_idx)
-        i_end = len(s_win)-1
-        buf = int(fps*0.5)
-        for i in range(search_s, len(s_win)-buf):
-            if s_win[i] < t_e and np.mean(s_win[i:i+buf]) < t_e:
-                i_end = i
-                break
-        return t_win[i_start], t_win[i_end]
-
-    # Specific "Gun Spike" Detection for Outside Rear
-    def find_gun_start(sig, start_g, end_g):
-        # Look for sudden spike in Derivative (Acceleration of activity)
-        mask = (df['Time'] >= start_g) & (df['Time'] <= end_g)
-        if not np.any(mask): return start_g
-        
-        s_win = sig[mask]
-        t_win = df['Time'][mask].values
-        
-        # Rate of change
-        grad = np.gradient(s_win)
-        
-        # Find the first major positive spike in activity (Gun On)
-        # Threshold: The spike must be sharp (> 30% of max gradient)
-        max_grad = np.max(grad)
-        thresh_spike = max_grad * 0.3
-        
-        spikes = np.where(grad > thresh_spike)[0]
-        
-        if len(spikes) > 0:
-            return t_win[spikes[0]]
-        else:
-            # Fallback to standard threshold
-            t_s, _ = get_window(sig, start_g, end_g, 0.5)
-            return t_s
-
-    map_act = {}
-    map_fy = {}
-    if arrival_dir > 0: 
-        map_act['Inside Rear'] = 'Act_BL_Sm'; map_fy['Inside Rear'] = 'Fy_BL_Sm'
-        map_act['Outside Rear'] = 'Act_TL_Sm'; map_fy['Outside Rear'] = 'Fy_TL_Sm'
-        map_act['Inside Front'] = 'Act_BR_Sm'; map_fy['Inside Front'] = 'Fy_BR_Sm'
-        map_act['Outside Front'] = 'Act_TR_Sm'; map_fy['Outside Front'] = 'Fy_TR_Sm'
-    else: 
-        map_act['Inside Rear'] = 'Act_BR_Sm'; map_fy['Inside Rear'] = 'Fy_BR_Sm'
-        map_act['Outside Rear'] = 'Act_TR_Sm'; map_fy['Outside Rear'] = 'Fy_TR_Sm'
-        map_act['Inside Front'] = 'Act_BL_Sm'; map_fy['Inside Front'] = 'Fy_BL_Sm'
-        map_act['Outside Front'] = 'Act_TL_Sm'; map_fy['Outside Front'] = 'Fy_TL_Sm'
+    # 3. CORNER TIMING (6-Zone Mapping)
+    map_corners = {}
+    if arrival_dir > 0: # L->R
+        # Front=Right, Rear=Left. Outside=Top, Inside=Bottom.
+        # Rear Zones: TL (Outside), BL (Inside)
+        # Front Zones: TR (Outside), BR (Inside)
+        map_corners['Inside Rear'] = 'Act_BL_Sm'
+        map_corners['Outside Rear'] = 'Act_TL_Sm'
+        map_corners['Inside Front'] = 'Act_BR_Sm'
+        map_corners['Outside Front'] = 'Act_TR_Sm'
+    else: # R->L
+        # Front=Left, Rear=Right.
+        # Rear Zones: TR (Outside), BR (Inside)
+        # Front Zones: TL (Outside), BL (Inside)
+        map_corners['Inside Rear'] = 'Act_BR_Sm'
+        map_corners['Outside Rear'] = 'Act_TR_Sm'
+        map_corners['Inside Front'] = 'Act_BL_Sm'
+        map_corners['Outside Front'] = 'Act_TL_Sm'
 
     corner_stats = {}
     if t_up and t_down:
         t_ae = t_end
+        df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
+        times_j = df_j['Time'].values
         
-        # Front
-        of = df[map_act['Outside Front']].values
-        if_ = df[map_act['Inside Front']].values
+        def get_window(sig, start_g, end_g, sens, min_dur=0.5):
+            mask = (times_j >= start_g) & (times_j <= end_g)
+            if not np.any(mask): return start_g, start_g
+            s_win = sig[mask]
+            t_win = times_j[mask]
+            base = np.percentile(s_win, 10)
+            peak = np.max(s_win)
+            if peak < 0.5: return start_g, start_g
+            
+            t_s = base + (peak-base) * sens
+            t_e = base + (peak-base) * 0.20
+            
+            active = np.where(s_win > t_s)[0]
+            if len(active) == 0: return start_g, start_g
+            i_start = active[0]
+            
+            peak_idx = np.argmax(s_win)
+            search_s = max(i_start, peak_idx)
+            i_end = len(s_win)-1
+            buf = int(fps*0.5)
+            for i in range(search_s, len(s_win)-buf):
+                if s_win[i] < t_e and np.mean(s_win[i:i+buf]) < t_e:
+                    i_end = i
+                    break
+            return t_win[i_start], t_win[i_end]
+        
+        # A. FRONT (Standard)
+        of = df_j[map_corners['Outside Front']].values
+        if_ = df_j[map_corners['Inside Front']].values
         ts_of, te_of = get_window(of, t_up, t_ae, 0.3)
         ts_if, te_if = get_window(if_, ts_of+1.5, t_ae, 0.3)
         corner_stats['Outside Front'] = (ts_of, te_of)
         corner_stats['Inside Front'] = (ts_if, te_if)
         
-        # Rear
-        ir = df[map_act['Inside Rear']].values
-        or_ = df[map_act['Outside Rear']].values
-        fy_ir = df[map_fy['Inside Rear']].values
+        # B. REAR (6-Zone Separation)
+        ir = df_j[map_corners['Inside Rear']].values
+        or_ = df_j[map_corners['Outside Rear']].values
         
-        # 1. IR Start (Sensitive)
-        ts_ir, _ = get_window(ir, t_up, t_ae, 0.15)
+        # 1. Outside Rear (Gun Spike - 0.55 Sens)
+        ts_or, te_or = get_window(or_, t_up+2.5, t_ae, 0.55)
         
-        # 2. OR Start (GUN SPIKE LOGIC)
-        # Look for the "Gun On" moment specifically
-        ts_or = find_gun_start(or_, t_up + 3.0, t_ae)
+        # 2. Inside Rear (Sensitive Start, Cliff End)
+        # Because the Fueler is in the "Center" zone now, the "Inside Rear" zone 
+        # should show a clean drop when the tire changer leaves.
         
-        # Find OR End
-        _, te_or = get_window(or_, ts_or, t_ae, 0.3)
+        # Find Start
+        ts_ir, te_ir_raw = get_window(ir, t_up, t_ae, 0.15)
         
-        # 3. IR End (Movement Vector / Transition)
-        # Look for upward movement in the gap
-        search_end = ts_or
-        search_start = max(ts_ir + 1.5, search_end - 2.0) # Look in 2s window before OR start
+        # Find End: Look for Energy Cliff
+        # Search between Peak and OR Start
+        search_s = ts_ir + 1.0
+        search_e = ts_or
         
-        mask_gap = (df['Time'] >= search_start) & (df['Time'] <= search_end)
-        if np.any(mask_gap):
-            fy_gap = fy_ir[mask_gap]
-            t_gap = df['Time'][mask_gap].values
-            
-            # Find peak upward movement
-            min_idx = np.argmin(fy_gap)
-            if fy_gap[min_idx] < -0.5:
-                te_ir = t_gap[min_idx]
+        if search_e > search_s:
+            mask_c = (df['Time'] >= search_s) & (df['Time'] <= search_e)
+            if np.any(mask_c):
+                sig_c = df.loc[mask_c, map_corners['Inside Rear'] + '_Sm'].values
+                time_c = df.loc[mask_c, 'Time'].values
+                grad = np.gradient(sig_c)
+                min_grad_idx = np.argmin(grad)
+                
+                if grad[min_grad_idx] < -0.2: # Sharp drop
+                    te_ir = time_c[min_grad_idx]
+                else:
+                    te_ir = te_ir_raw # Fallback
             else:
-                # If no clear movement vector, assume transition took ~1.2s
-                te_ir = max(ts_ir+2.0, ts_or - 1.2)
+                 te_ir = te_ir_raw
         else:
-            te_ir = ts_or - 1.2
-            
-        # Safety Clamps
-        if te_ir > ts_or: te_ir = ts_or - 0.5
-        if te_ir < ts_ir + 2.0: te_ir = ts_ir + 2.0
+             te_ir = te_ir_raw
         
+        # Safety: IR End cannot be > OR Start
+        if te_ir > ts_or: 
+            te_ir = ts_or - 0.5 # Minimum transition gap
+            
         corner_stats['Inside Rear'] = (ts_ir, te_ir)
         corner_stats['Rear Transition'] = (te_ir, ts_or)
         corner_stats['Outside Rear'] = (ts_or, te_or)
@@ -333,17 +310,16 @@ def analyze_states_v53(df, fps):
     t_fuel_start, t_fuel_end = None, None
     if t_start and t_end:
         fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
-        if not fuel_w.empty:
-            s_in = fuel_w['S_In_Sm'].values
-            times = fuel_w['Time'].values
-            is_fueling = s_in > 0.50
-            indices = np.where(is_fueling)[0]
-            if len(indices) > int(fps * 2.0):
-                t_fuel_start = times[indices[0]]
-                diffs = np.diff(indices)
+        matches = fuel_w['Probe_Match_Sm'].values
+        if len(matches) > 0 and np.max(matches) > 0.55:
+            active = matches > 0.55
+            idx = np.where(active)[0]
+            if len(idx) > int(fps*2):
+                t_fuel_start = fuel_w.iloc[idx[0]]['Time']
+                diffs = np.diff(idx)
                 splits = np.where(diffs > 20)[0]
-                end_idx = indices[splits[0]] if len(splits) > 0 else indices[-1]
-                t_fuel_end = times[end_idx]
+                end_idx = idx[splits[0]] if len(splits) > 0 else idx[-1]
+                t_fuel_end = fuel_w.iloc[end_idx]['Time']
                 if t_fuel_end > t_end - 0.5: t_fuel_end = t_end - 0.5
 
     if t_up is None: t_up = t_start
@@ -364,7 +340,6 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
     
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
-    
     labels = ["Inside Rear", "Outside Rear", "Outside Front", "Inside Front"]
     
     while cap.isOpened():
@@ -431,8 +406,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
             safe_idx = min(frame_idx, len(df)-1)
             row = df.iloc[safe_idx]
             sc = row.get('S_In_Sm', 0.0)
-            ppl = row.get('Fueler_Present_Sm', 0.0)
-            cv2.putText(frame, f"P:{sc:.2f} H:{ppl:.1f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
+            cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
             
             fb = row.get('Fuel_Box')
             if fb is not None and not pd.isna(fb):
@@ -449,9 +423,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V53")
-    st.markdown("### Gun-Spike Logic")
-    st.info("Detects 'Gun On' for Outside Rear (Sharp Activity Spike) to extend transition time correctly.")
+    st.title("🏁 Pit Stop Analyzer V56")
+    st.markdown("### 6-Zone Grid Logic")
+    st.info("Splits detection into 6 zones (Rear/Mid/Front x In/Out). Isolate Fueler in 'Inside-Center' from 'Inside-Rear'.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -474,11 +448,11 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (Multi-Template)...")
+            st.write("Step 1: Extraction (6-Zone)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v53(df, fps)
+            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v56(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -503,36 +477,35 @@ def main():
         
         if len(timings) == 4:
             pit_t, tire_t, fuel_t, corners = timings
+            
+            st.divider()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Pit Stop Time", f"{pit_t[1] - pit_t[0]:.2f}s")
+            f_dur = (fuel_t[1] - fuel_t[0]) if (fuel_t[0] and fuel_t[1]) else 0
+            c2.metric("Fueling Time", f"{f_dur:.2f}s" if f_dur > 0 else "N/A")
+            t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
+            c3.metric("Tire Change Time", f"{t_dur:.2f}s")
+            
+            st.write("### 🛞 Rear Breakdown")
+            c_ir = corners.get('Inside Rear', (0,0))
+            c_or = corners.get('Outside Rear', (0,0))
+            c_tr = corners.get('Rear Transition', (0,0))
+            
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Inside Rear", f"{c_ir[1]-c_ir[0]:.2f}s")
+            t2.metric("Transition", f"{c_tr[1]-c_tr[0]:.2f}s")
+            t3.metric("Outside Rear", f"{c_or[1]-c_or[0]:.2f}s")
+            
+            st.subheader("Video Result")
+            c1, c2 = st.columns([3,1])
+            with c1:
+                if os.path.exists(vid_path): st.video(vid_path)
+            with c2:
+                if os.path.exists(vid_path):
+                    with open(vid_path, 'rb') as f:
+                        st.download_button("Download MP4", f, file_name="pitstop_v56.mp4")
         else:
             st.warning("Please re-run analysis.")
-            st.stop()
-        
-        st.divider()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Pit Stop Time", f"{pit_t[1] - pit_t[0]:.2f}s")
-        f_dur = (fuel_t[1] - fuel_t[0]) if (fuel_t[0] and fuel_t[1]) else 0
-        c2.metric("Fueling Time", f"{f_dur:.2f}s" if f_dur > 0 else "N/A")
-        t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
-        c3.metric("Tire Change Time", f"{t_dur:.2f}s")
-        
-        st.write("### 🛞 Rear Breakdown")
-        c_ir = corners.get('Inside Rear', (0,0))
-        c_or = corners.get('Outside Rear', (0,0))
-        c_tr = corners.get('Rear Transition', (0,0))
-        
-        t1, t2, t3 = st.columns(3)
-        t1.metric("Inside Rear", f"{c_ir[1]-c_ir[0]:.2f}s")
-        t2.metric("Transition", f"{c_tr[1]-c_tr[0]:.2f}s")
-        t3.metric("Outside Rear", f"{c_or[1]-c_or[0]:.2f}s")
-        
-        st.subheader("Video Result")
-        c1, c2 = st.columns([3,1])
-        with c1:
-            if os.path.exists(vid_path): st.video(vid_path)
-        with c2:
-            if os.path.exists(vid_path):
-                with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v53.mp4")
 
 if __name__ == "__main__":
     main()
