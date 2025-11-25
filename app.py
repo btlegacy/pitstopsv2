@@ -118,8 +118,8 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V60 (Double Transition) ---
-def analyze_states_v60(df, fps):
+# --- PASS 2: Analysis V61 (Bugfix) ---
+def analyze_states_v61(df, fps):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR',
             'Fy_TL', 'Fy_TR', 'Fy_BL', 'Fy_BR']
@@ -224,7 +224,7 @@ def analyze_states_v60(df, fps):
                     break
             return t_win[i_start], t_win[i_end]
 
-        # Specific Gun Spike Detector
+        # Gun Spike
         def find_gun_start(sig, start_g, end_g):
             mask = (times_j >= start_g) & (times_j <= end_g)
             if not np.any(mask): return start_g
@@ -236,21 +236,13 @@ def analyze_states_v60(df, fps):
             if len(spikes)>0: return t_win[spikes[0]]
             return get_window(sig, start_g, end_g, 0.5)[0]
 
-        # A. FRONT (OF -> Trans -> IF)
+        # A. FRONT
         of = df_j[map_act['Outside Front']].values
         if_ = df_j[map_act['Inside Front']].values
-        
-        # 1. Outside Front
         t_of_start, t_of_end = get_window(of, t_up, t_ae, 0.3)
-        
-        # 2. Inside Front (Starts after OF)
         t_if_start, t_if_end = get_window(if_, t_of_start + 1.5, t_ae, 0.3)
         
-        # 3. Front Transition
-        # Gap between OF End and IF Start
-        # If they overlap (data noise), force sequentiality
         if t_if_start < t_of_end:
-             # Overlap? Assume IF started after OF truly finished
              mid = (t_of_end + t_if_start) / 2
              t_trans_f_start = mid
              t_trans_f_end = mid
@@ -262,10 +254,9 @@ def analyze_states_v60(df, fps):
         corner_stats['Front Transition'] = (t_trans_f_start, t_trans_f_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # B. REAR (IR -> Trans -> OR)
+        # B. REAR
         ir = df_j[map_act['Inside Rear']].values
         or_ = df_j[map_act['Outside Rear']].values
-        fy_ir = df_j[map_fy['Inside Rear']].values
         
         # 1. OR Start (Gun Spike)
         t_or_start = find_gun_start(or_, t_up + 2.5, t_ae)
@@ -283,8 +274,10 @@ def analyze_states_v60(df, fps):
         if search_e > search_s:
             mask_gap = (df['Time'] >= search_s) & (df['Time'] <= search_e)
             if np.any(mask_gap):
-                fy_gap = df.loc[mask_gap, map_fy['Inside Rear'] + '_Sm'].values
+                # FIXED LINE: map_fy value already contains _Sm
+                fy_gap = df.loc[mask_gap, map_fy['Inside Rear']].values
                 t_gap = df.loc[mask_gap, 'Time'].values
+                
                 min_idx = np.argmin(fy_gap)
                 if fy_gap[min_idx] < -0.5:
                     t_ir_end = t_gap[min_idx]
@@ -334,7 +327,6 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
     
-    # Display Order
     labels_ui_config = [
         ("Inside Rear", "Inside Rear"),
         ("Rear Transition", "  > R-Transition"),
@@ -412,9 +404,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V60")
-    st.markdown("### Front & Rear Transition Logic")
-    st.info("Tracks transitions separately for Front Axle (OF->IF) and Rear Axle (IR->OR).")
+    st.title("🏁 Pit Stop Analyzer V61")
+    st.markdown("### Fixed Column Access")
+    st.info("Fixed double-suffix crash in Rear Transition logic. Includes all features from V60.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -437,11 +429,11 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction...")
+            st.write("Step 1: Extraction (Multi-Template)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v60(df, fps)
+            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v61(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -462,38 +454,43 @@ def main():
     if st.session_state['analysis_done']:
         df = st.session_state['df']
         vid_path = st.session_state['video_path']
-        pit_t, tire_t, fuel_t, corners = st.session_state['timings']
+        timings = st.session_state['timings']
         
-        st.divider()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Pit Stop Time", f"{pit_t[1] - pit_t[0]:.2f}s")
-        f_dur = (fuel_t[1] - fuel_t[0]) if (fuel_t[0] and fuel_t[1]) else 0
-        c2.metric("Fueling Time", f"{f_dur:.2f}s" if f_dur > 0 else "N/A")
-        t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
-        c3.metric("Tire Change Time", f"{t_dur:.2f}s")
-        
-        st.write("### 🛞 Axle Breakdown")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Rear Axle**")
-            st.write(f"Inside Rear: {corners.get('Inside Rear', (0,0))[1] - corners.get('Inside Rear', (0,0))[0]:.2f}s")
-            st.write(f"Transition: {corners.get('Rear Transition', (0,0))[1] - corners.get('Rear Transition', (0,0))[0]:.2f}s")
-            st.write(f"Outside Rear: {corners.get('Outside Rear', (0,0))[1] - corners.get('Outside Rear', (0,0))[0]:.2f}s")
+        if len(timings) == 4:
+            pit_t, tire_t, fuel_t, corners = timings
             
-        with c2:
-            st.markdown("**Front Axle**")
-            st.write(f"Outside Front: {corners.get('Outside Front', (0,0))[1] - corners.get('Outside Front', (0,0))[0]:.2f}s")
-            st.write(f"Transition: {corners.get('Front Transition', (0,0))[1] - corners.get('Front Transition', (0,0))[0]:.2f}s")
-            st.write(f"Inside Front: {corners.get('Inside Front', (0,0))[1] - corners.get('Inside Front', (0,0))[0]:.2f}s")
-
-        st.subheader("Video Result")
-        c1, c2 = st.columns([3,1])
-        with c1:
-            if os.path.exists(vid_path): st.video(vid_path)
-        with c2:
-            if os.path.exists(vid_path):
-                with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v60.mp4")
+            st.divider()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Pit Stop Time", f"{pit_t[1] - pit_t[0]:.2f}s")
+            f_dur = (fuel_t[1] - fuel_t[0]) if (fuel_t[0] and fuel_t[1]) else 0
+            c2.metric("Fueling Time", f"{f_dur:.2f}s" if f_dur > 0 else "N/A")
+            t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
+            c3.metric("Tire Change Time", f"{t_dur:.2f}s")
+            
+            st.write("### 🛞 Axle Breakdown")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Rear Axle**")
+                st.write(f"Inside Rear: {corners.get('Inside Rear', (0,0))[1] - corners.get('Inside Rear', (0,0))[0]:.2f}s")
+                st.write(f"Transition: {corners.get('Rear Transition', (0,0))[1] - corners.get('Rear Transition', (0,0))[0]:.2f}s")
+                st.write(f"Outside Rear: {corners.get('Outside Rear', (0,0))[1] - corners.get('Outside Rear', (0,0))[0]:.2f}s")
+                
+            with c2:
+                st.markdown("**Front Axle**")
+                st.write(f"Outside Front: {corners.get('Outside Front', (0,0))[1] - corners.get('Outside Front', (0,0))[0]:.2f}s")
+                st.write(f"Transition: {corners.get('Front Transition', (0,0))[1] - corners.get('Front Transition', (0,0))[0]:.2f}s")
+                st.write(f"Inside Front: {corners.get('Inside Front', (0,0))[1] - corners.get('Inside Front', (0,0))[0]:.2f}s")
+            
+            st.subheader("Video Result")
+            c1, c2 = st.columns([3,1])
+            with c1:
+                if os.path.exists(vid_path): st.video(vid_path)
+            with c2:
+                if os.path.exists(vid_path):
+                    with open(vid_path, 'rb') as f:
+                        st.download_button("Download MP4", f, file_name="pitstop_v61.mp4")
+        else:
+            st.warning("Please re-run analysis.")
 
 if __name__ == "__main__":
     main()
