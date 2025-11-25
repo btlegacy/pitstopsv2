@@ -17,15 +17,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def load_model():
     return YOLO('yolov8n.pt')
 
-def load_ref_image(folder_name):
+def load_templates(folder_name):
+    templates = []
     path = os.path.join(BASE_DIR, "refs", folder_name, "*")
     files = glob.glob(path)
     if not files:
         path = os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
         files = glob.glob(path)
-    if files:
-        return cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
-    return None
+    for f in files:
+        if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+            img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+            if img is not None: templates.append(img)
+    return templates
 
 # --- PASS 1: Extraction ---
 def extract_telemetry(video_path, progress_callback):
@@ -38,10 +41,11 @@ def extract_telemetry(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    ref_probe = load_ref_image("probein")
-
+    temps_in = load_templates("probein")
+    
     telemetry_data = []
     
+    # Global ROI
     g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
@@ -63,7 +67,6 @@ def extract_telemetry(video_path, progress_callback):
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         fx = flow[..., 0]
         fy = flow[..., 1]
-        
         mag = np.sqrt(fx**2 + fy**2)
         active = mag > 1.0 
         flow_x = np.median(fx[active]) if np.any(active) else 0.0
@@ -92,19 +95,45 @@ def extract_telemetry(video_path, progress_callback):
         fy_br = np.mean(q_fy[mid_h:, mid_w:])
         
         # 4. Fuel
-        probe_score = 0.0
-        if ref_probe is not None:
-             if curr_roi.shape[0] >= ref_probe.shape[0] and curr_roi.shape[1] >= ref_probe.shape[1]:
-                res = cv2.matchTemplate(curr_roi, ref_probe, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, _ = cv2.minMaxLoc(res)
-                probe_score = max_val
+        score_in = 0.0
+        fuel_box = None
+        
+        results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
+        if results[0].boxes.id is not None:
+            boxes = results[0].boxes.xywh.cpu().numpy()
+            valid_indices = [i for i, b in enumerate(boxes) if b[1] < height * 0.9]
+            
+            if valid_indices:
+                valid_boxes = boxes[valid_indices]
+                largest_idx = np.argmax(valid_boxes[:, 2] * valid_boxes[:, 3])
+                cx, cy, cw, ch = valid_boxes[largest_idx]
+                
+                margin = 20
+                x1 = int(cx - cw/2) - margin
+                y1 = int(cy - ch/2) - margin
+                x2 = int(cx + cw/2) + margin
+                y2 = int(cy + ch/2) + margin
+                
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                
+                if (x2 > x1) and (y2 > y1):
+                    fuel_zone = gray[y1:y2, x1:x2]
+                    fuel_box = (x1, y1, x2-x1, y2-y1)
+                    
+                    for t in temps_in:
+                        if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            _, max_val, _, _ = cv2.minMaxLoc(res)
+                            if max_val > score_in: score_in = max_val
 
         telemetry_data.append({
             "Frame": frame_idx,
             "Time": frame_idx / fps,
             "Flow_X": flow_x,
             "Zoom_Score": zoom_score,
-            "Probe_Match": probe_score,
+            "S_In": score_in,
+            "Fuel_Box": fuel_box, 
             "Act_TL": act_tl, "Fy_TL": fy_tl,
             "Act_TR": act_tr, "Fy_TR": fy_tr,
             "Act_BL": act_bl, "Fy_BL": fy_bl,
@@ -118,10 +147,10 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V61 (Bugfix) ---
-def analyze_states_v61(df, fps):
+# --- PASS 2: Analysis V62 (Forced Transitions) ---
+def analyze_states_v62(df, fps):
     window = 15
-    cols = ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR',
+    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR',
             'Fy_TL', 'Fy_TR', 'Fy_BL', 'Fy_BR']
     for col in cols:
         if col in df.columns:
@@ -236,27 +265,47 @@ def analyze_states_v61(df, fps):
             if len(spikes)>0: return t_win[spikes[0]]
             return get_window(sig, start_g, end_g, 0.5)[0]
 
-        # A. FRONT
+        # A. FRONT (Forced Transition Logic V62)
         of = df_j[map_act['Outside Front']].values
         if_ = df_j[map_act['Inside Front']].values
-        t_of_start, t_of_end = get_window(of, t_up, t_ae, 0.3)
-        t_if_start, t_if_end = get_window(if_, t_of_start + 1.5, t_ae, 0.3)
         
-        if t_if_start < t_of_end:
-             mid = (t_of_end + t_if_start) / 2
-             t_trans_f_start = mid
-             t_trans_f_end = mid
+        # 1. Outside Front Start (Standard)
+        t_of_start, t_of_raw_end = get_window(of, t_up, t_ae, 0.3)
+        
+        # 2. Inside Front Start (Gun Spike - because this is the 2nd action)
+        # Look for IF start AFTER OF start
+        t_if_start = find_gun_start(if_, t_of_start + 2.0, t_ae)
+        _, t_if_end = get_window(if_, t_if_start, t_ae, 0.3)
+        
+        # 3. Force Front Transition
+        # OF End must happen ~1.0s before IF Start
+        if t_if_start > t_of_start + 3.0:
+            t_of_max_end = t_if_start - 1.0
+            if t_of_raw_end > t_of_max_end:
+                t_of_end = t_of_max_end
+            else:
+                t_of_end = t_of_raw_end
+                
+            # Ensure valid duration
+            if t_of_end < t_of_start + 1.5: t_of_end = t_of_start + 1.5
         else:
-             t_trans_f_start = t_of_end
-             t_trans_f_end = t_if_start
+             t_of_end = t_of_raw_end
+
+        # Define Front Transition
+        t_trans_f_start = t_of_end
+        t_trans_f_end = t_if_start
+        
+        # Clamps
+        if t_trans_f_end < t_trans_f_start: t_trans_f_end = t_trans_f_start
              
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
         corner_stats['Front Transition'] = (t_trans_f_start, t_trans_f_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # B. REAR
+        # B. REAR (Forced Transition Logic)
         ir = df_j[map_act['Inside Rear']].values
         or_ = df_j[map_act['Outside Rear']].values
+        fy_ir = df_j[map_fy['Inside Rear']].values
         
         # 1. OR Start (Gun Spike)
         t_or_start = find_gun_start(or_, t_up + 2.5, t_ae)
@@ -265,7 +314,7 @@ def analyze_states_v61(df, fps):
         # 2. IR Start
         t_ir_start, _ = get_window(ir, t_up, t_ae, 0.15)
         
-        # 3. IR End (Lean Logic)
+        # 3. IR End
         search_s = max(t_ir_start + 1.5, t_or_start - 2.0)
         search_e = t_or_start
         
@@ -274,10 +323,8 @@ def analyze_states_v61(df, fps):
         if search_e > search_s:
             mask_gap = (df['Time'] >= search_s) & (df['Time'] <= search_e)
             if np.any(mask_gap):
-                # FIXED LINE: map_fy value already contains _Sm
-                fy_gap = df.loc[mask_gap, map_fy['Inside Rear']].values
+                fy_gap = df.loc[mask_gap, map_fy['Inside Rear'] + '_Sm'].values
                 t_gap = df.loc[mask_gap, 'Time'].values
-                
                 min_idx = np.argmin(fy_gap)
                 if fy_gap[min_idx] < -0.5:
                     t_ir_end = t_gap[min_idx]
@@ -404,9 +451,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V61")
-    st.markdown("### Fixed Column Access")
-    st.info("Fixed double-suffix crash in Rear Transition logic. Includes all features from V60.")
+    st.title("🏁 Pit Stop Analyzer V62")
+    st.markdown("### Forced Front Transition")
+    st.info("Back-calculates Outside Front end time to ensure proper transition gap to Inside Front.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -433,7 +480,7 @@ def main():
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v61(df, fps)
+            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v62(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -488,7 +535,7 @@ def main():
             with c2:
                 if os.path.exists(vid_path):
                     with open(vid_path, 'rb') as f:
-                        st.download_button("Download MP4", f, file_name="pitstop_v61.mp4")
+                        st.download_button("Download MP4", f, file_name="pitstop_v62.mp4")
         else:
             st.warning("Please re-run analysis.")
 
