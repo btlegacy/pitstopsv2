@@ -8,6 +8,7 @@ import pandas as pd
 import altair as alt
 from scipy.signal import savgol_filter, find_peaks
 from ultralytics import YOLO
+from collections import Counter
 
 # --- Configuration ---
 st.set_page_config(page_title="Pit Stop Analytics AI", layout="wide")
@@ -30,7 +31,7 @@ def load_templates(folder_name):
             if img is not None: templates.append(img)
     return templates
 
-# --- PASS 1: Extraction ---
+# --- PASS 1: Extraction (Crew + Car Tracking) ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -49,11 +50,10 @@ def extract_telemetry(video_path, progress_callback):
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
     
+    frame_idx = 0
     ret, prev_frame = cap.read()
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     prev_roi = prev_gray[g_y1:g_y2, g_x1:g_x2]
-    
-    frame_idx = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -89,7 +89,7 @@ def extract_telemetry(video_path, progress_callback):
         score_in = 0.0
         fuel_box = None
         person_tracks = [] 
-        current_car_box = None # (cx, cy, w, h)
+        current_car_box = None 
         
         results = model.track(frame, persist=True, classes=[0, 2], verbose=False, conf=0.15)
         
@@ -98,7 +98,7 @@ def extract_telemetry(video_path, progress_callback):
             cls = results[0].boxes.cls.cpu().numpy()
             ids = results[0].boxes.id.cpu().numpy()
             
-            # Identify Car
+            # Car
             car_indices = [i for i, c in enumerate(cls) if int(c) == 2]
             if car_indices:
                 valid_cars = [i for i in car_indices if boxes[i][1] < height * 0.9]
@@ -113,7 +113,6 @@ def extract_telemetry(video_path, progress_callback):
                     y1 = int(cy - ch/2) - margin
                     x2 = int(cx + cw/2) + margin
                     y2 = int(cy + ch/2) + margin
-                    
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(width, x2), min(height, y2)
                     
@@ -125,7 +124,7 @@ def extract_telemetry(video_path, progress_callback):
                                 sc = cv2.minMaxLoc(res)[1]
                                 if sc > score_in: score_in = sc
             
-            # Store People
+            # People
             for i, c in enumerate(cls):
                 if int(c) == 0:
                     if boxes[i][1] < height * 0.95:
@@ -140,7 +139,7 @@ def extract_telemetry(video_path, progress_callback):
             "Act_TL": act_tl, "Act_TR": act_tr,
             "Act_BL": act_bl, "Act_BR": act_br,
             "Person_Tracks": person_tracks,
-            "Car_Box": current_car_box # Save Car Box for dynamic zoning
+            "Car_Box": current_car_box
         })
         
         prev_roi = curr_roi
@@ -150,7 +149,7 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis ---
+# --- PASS 2: Analysis V65 (Gun Spike + Forced Transitions) ---
 def analyze_states_v65(df, fps):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
@@ -219,6 +218,7 @@ def analyze_states_v65(df, fps):
         map_corners['Inside Front'] = 'Act_BL_Sm'; map_corners['Outside Front'] = 'Act_TL_Sm'
 
     corner_stats = {}
+    
     if t_up and t_down:
         t_ae = t_end 
         df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
@@ -261,11 +261,12 @@ def analyze_states_v65(df, fps):
             if len(spikes)>0: return t_win[spikes[0]]
             return get_window(sig, start_g, end_g, 0.5)[0]
 
-        # Front
+        # A. FRONT
         of = df_j[map_corners['Outside Front']].values
         if_ = df_j[map_corners['Inside Front']].values
         t_of_start, t_of_end = get_window(of, t_up, t_ae, 0.3)
         t_if_start, t_if_end = get_window(if_, t_of_start+1.5, t_ae, 0.3)
+        
         if t_if_start < t_of_end:
              mid = (t_of_end + t_if_start) / 2
              t_trans_f_start = mid
@@ -277,9 +278,10 @@ def analyze_states_v65(df, fps):
         corner_stats['Front Transition'] = (t_trans_f_start, t_trans_f_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # Rear
+        # B. REAR
         ir = df_j[map_corners['Inside Rear']].values
         or_ = df_j[map_corners['Outside Rear']].values
+        
         t_or_start = find_gun_start(or_, t_up + 2.5, t_ae)
         _, t_or_end = get_window(or_, t_or_start, t_ae, 0.2)
         t_ir_start, t_ir_raw_end = get_window(ir, t_up, t_ae, 0.15)
@@ -319,7 +321,7 @@ def analyze_states_v65(df, fps):
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
-    return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats, arrival_dir
+    return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats, arrival_dir, df
 
 # --- PASS 3: Render ---
 def render_overlay(input_path, pit, tires, fuel, corner_data, arrival_dir, df, fps, width, height, show_debug, progress_callback):
@@ -334,88 +336,79 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, arrival_dir, df, f
     
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
-    labels = ["Inside Rear", "Outside Rear", "Outside Front", "Inside Front"]
+    
+    labels_ui = [
+        ("Inside Rear", "Inside Rear"),
+        ("Rear Transition", "  > R-Transition"),
+        ("Outside Rear", "Outside Rear"),
+        ("Outside Front", "Outside Front"),
+        ("Front Transition", "  > F-Transition"),
+        ("Inside Front", "Inside Front")
+    ]
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
         curr = frame_idx / fps
         
-        # --- UI ---
-        cv2.rectangle(frame, (width-450, 0), (width, 360), (0,0,0), -1)
+        # UI
+        cv2.rectangle(frame, (width-450, 0), (width, 400), (0,0,0), -1)
         
-        # Main Timers
+        # Global Timers
         val_pit = (t_end-t_start) if (t_start and curr >= t_end) else (curr-t_start if t_start and curr >= t_start else 0.0)
         cv2.putText(frame, "PIT STOP", (width-430, 40), 0, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{val_pit:.2f}s", (width-180, 40), 0, 1.2, (0,255,0) if val_pit>0 else (200,200,200), 3)
-
+        
         # Corner Timers
         start_y = 180
         gap_y = 30
-        for i, label in enumerate(labels):
+        for i, (key, display) in enumerate(labels_ui):
             y_pos = start_y + (i*gap_y)
-            c_start, c_end = corner_data.get(label, (0.0, 0.0))
-            val = 0.0
-            col = (150,150,150)
+            c_start, c_end = corner_data.get(key, (0.0, 0.0))
             
+            c_val = 0.0
             if c_start > 0 and curr >= c_start:
                 val = (c_end - c_start) if (curr >= c_end) else (curr - c_start)
-                val = max(0.0, val)
-                col = (255,255,255)
-                if curr >= c_end and c_end > 0: col = (255,200,100) # Done
+                c_val = max(0.0, val)
+            
+            col = (255,255,0) if "Transition" in key else (255,255,255)
+            txt_col = col if c_val > 0 else (100,100,100)
+            
+            cv2.putText(frame, display, (width-430, y_pos), 0, 0.6, txt_col, 1)
+            cv2.putText(frame, f"{c_val:.2f}s", (width-100, y_pos), 0, 0.6, txt_col, 2)
 
-            cv2.putText(frame, label, (width-430, y_pos), 0, 0.6, col, 1)
-            cv2.putText(frame, f"{val:.2f}s", (width-100, y_pos), 0, 0.6, col, 2)
-
-        # --- DYNAMIC CREW LABELING ---
-        # Get current car box to define dynamic zones
+        # --- DYNAMIC CREW LABELS ---
         if frame_idx < len(df):
             row = df.iloc[frame_idx]
             car_box = row.get('Car_Box')
             
             if car_box is not None and not pd.isna(car_box).any():
                 cx, cy, cw, ch = car_box
-                
-                # Define Search Zones based on Arrival Direction
-                # L->R: Rear=Left, Front=Right, Inside=Bottom, Outside=Top
-                # Extend zones OUTWARDS from the car
-                
-                search_margin = 60 # Look 60px around the corner
+                search_margin = 60 
                 
                 if arrival_dir > 0: # L->R
-                    # Rear Changer: Inside (Bottom) Rear (Left)
                     rz_x1, rz_y1 = int(cx - cw/2 - search_margin), int(cy + ch/2 - search_margin)
                     rz_x2, rz_y2 = int(cx - cw/2 + search_margin), int(cy + ch/2 + search_margin*2)
-                    
-                    # Front Changer: Outside (Top) Front (Right)
                     fz_x1, fz_y1 = int(cx + cw/2 - search_margin), int(cy - ch/2 - search_margin*2)
                     fz_x2, fz_y2 = int(cx + cw/2 + search_margin), int(cy - ch/2 + search_margin)
                 else: # R->L
-                    # Rear Changer: Inside (Bottom) Rear (Right)
                     rz_x1, rz_y1 = int(cx + cw/2 - search_margin), int(cy + ch/2 - search_margin)
                     rz_x2, rz_y2 = int(cx + cw/2 + search_margin), int(cy + ch/2 + search_margin*2)
-                    
-                    # Front Changer: Outside (Top) Front (Left)
                     fz_x1, fz_y1 = int(cx - cw/2 - search_margin), int(cy - ch/2 - search_margin*2)
                     fz_x2, fz_y2 = int(cx - cw/2 + search_margin), int(cy - ch/2 + search_margin)
 
-                # Draw Zones if Debug
                 if show_debug:
                     cv2.rectangle(frame, (rz_x1, rz_y1), (rz_x2, rz_y2), (0, 100, 0), 1)
                     cv2.rectangle(frame, (fz_x1, fz_y1), (fz_x2, fz_y2), (0, 100, 100), 1)
                 
-                # Check People Tracks
                 tracks = row.get('Person_Tracks')
                 if isinstance(tracks, list):
                     for (pid, px, py, pw, ph) in tracks:
-                        # Check center of person
                         if (rz_x1 < px < rz_x2) and (rz_y1 < py < rz_y2):
-                            # Found Rear Changer
                             cv2.rectangle(frame, (int(px-pw/2), int(py-ph/2)), (int(px+pw/2), int(py+ph/2)), (0, 255, 0), 2)
                             cv2.putText(frame, "Rear Changer", (int(px-pw/2), int(py-ph/2)-5), 0, 0.5, (0, 255, 0), 1)
                         
                         if (fz_x1 < px < fz_x2) and (fz_y1 < py < fz_y2):
-                            # Found Front Changer
                             cv2.rectangle(frame, (int(px-pw/2), int(py-ph/2)), (int(px+pw/2), int(py+ph/2)), (0, 165, 255), 2)
                             cv2.putText(frame, "Front Changer", (int(px-pw/2), int(py-ph/2)-5), 0, 0.5, (0, 165, 255), 1)
 
@@ -431,7 +424,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, arrival_dir, df, f
 def main():
     st.title("🏁 Pit Stop Analyzer V65")
     st.markdown("### Dynamic Spatial Labeling")
-    st.info("Labels crew members based on their real-time position relative to the car's corners.")
+    st.info("Labels crew members relative to car position. Includes V62/59 logic.")
 
     show_debug = st.sidebar.checkbox("Show Search Zones (Debug)", value=False)
 
@@ -458,16 +451,17 @@ def main():
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners, arr_dir = analyze_states_v56(df, fps)
+            # Corrected call to v65
+            pit_t, tire_t, fuel_t, corners, arr_dir, df_final = analyze_states_v65(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
             else:
                 st.write("Step 3: Rendering Video...")
-                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, arr_dir, df, fps, w, h, show_debug, bar.progress)
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, arr_dir, df_final, fps, w, h, show_debug, bar.progress)
                 
                 st.session_state.update({
-                    'df': df, 'video_path': vid_path, 
+                    'df': df_final, 'video_path': vid_path, 
                     'timings': (pit_t, tire_t, fuel_t, corners), 'analysis_done': True
                 })
             bar.empty()
@@ -491,6 +485,20 @@ def main():
             c2.metric("Fueling Time", f"{f_dur:.2f}s" if f_dur > 0 else "N/A")
             t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
             c3.metric("Tire Change Time", f"{t_dur:.2f}s")
+            
+            st.write("### 🛞 Axle Breakdown")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Rear Axle**")
+                st.write(f"Inside Rear: {corners.get('Inside Rear', (0,0))[1] - corners.get('Inside Rear', (0,0))[0]:.2f}s")
+                st.write(f"Transition: {corners.get('Rear Transition', (0,0))[1] - corners.get('Rear Transition', (0,0))[0]:.2f}s")
+                st.write(f"Outside Rear: {corners.get('Outside Rear', (0,0))[1] - corners.get('Outside Rear', (0,0))[0]:.2f}s")
+                
+            with c2:
+                st.markdown("**Front Axle**")
+                st.write(f"Outside Front: {corners.get('Outside Front', (0,0))[1] - corners.get('Outside Front', (0,0))[0]:.2f}s")
+                st.write(f"Transition: {corners.get('Front Transition', (0,0))[1] - corners.get('Front Transition', (0,0))[0]:.2f}s")
+                st.write(f"Inside Front: {corners.get('Inside Front', (0,0))[1] - corners.get('Inside Front', (0,0))[0]:.2f}s")
             
             st.subheader("Video Result")
             c1, c2 = st.columns([3,1])
