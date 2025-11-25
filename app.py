@@ -75,17 +75,16 @@ def extract_telemetry(video_path, progress_callback):
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         zoom_score = val_r - val_l
         
-        # 3. 4-Corner (Activity + Vertical Direction)
+        # 3. 4-Corner
         h_roi, w_roi = curr_roi.shape
         mid_h, mid_w = h_roi // 2, w_roi // 2
-        
         q_mag = mag 
         act_tl = np.mean(q_mag[:mid_h, :mid_w])
         act_tr = np.mean(q_mag[:mid_h, mid_w:])
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
-        # Vertical Flow (Y-Axis)
+        # Vertical Flow
         q_fy = fy
         fy_tl = np.mean(q_fy[:mid_h, :mid_w])
         fy_tr = np.mean(q_fy[:mid_h, mid_w:])
@@ -119,12 +118,11 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V57 (Lean-Away Logic) ---
-def analyze_states_v57(df, fps):
+# --- PASS 2: Analysis V58 (Valley Logic) ---
+def analyze_states_v58(df, fps):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR',
             'Fy_TL', 'Fy_TR', 'Fy_BL', 'Fy_BR']
-    
     for col in cols:
         if len(df) > window:
             df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
@@ -177,10 +175,10 @@ def analyze_states_v57(df, fps):
                 else: t_down = t_end
             else: t_down = t_end
 
-    # 3. CORNER TIMING
+    # 3. CORNER TIMING (Valley Logic)
     map_act = {}
     map_fy = {}
-    if arrival_dir > 0: # L->R
+    if arrival_dir > 0: 
         map_act['Inside Rear'] = 'Act_BL_Sm'; map_fy['Inside Rear'] = 'Fy_BL_Sm'
         map_act['Outside Rear'] = 'Act_TL_Sm'; map_fy['Outside Rear'] = 'Fy_TL_Sm'
         map_act['Inside Front'] = 'Act_BR_Sm'; map_fy['Inside Front'] = 'Fy_BR_Sm'
@@ -197,7 +195,6 @@ def analyze_states_v57(df, fps):
         df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
         times_j = df_j['Time'].values
         
-        # Helper Window
         def get_window(sig, start_g, end_g, sens=0.3):
             mask = (times_j >= start_g) & (times_j <= end_g)
             if not np.any(mask): return start_g, start_g
@@ -224,71 +221,74 @@ def analyze_states_v57(df, fps):
                     break
             return t_win[i_start], t_win[i_end]
 
-        # A. FRONT
-        of = df_j[map_act['Outside Front']].values
-        if_ = df_j[map_act['Inside Front']].values
-        ts_of, te_of = get_window(of, t_up, t_ae, 0.3)
-        ts_if, te_if = get_window(if_, ts_of+1.5, t_ae, 0.3)
-        corner_stats['Outside Front'] = (ts_of, te_of)
-        corner_stats['Inside Front'] = (ts_if, te_if)
+        # A. FRONT (Standard)
+        sig_of = df_j[map_act['Outside Front']].values
+        sig_if = df_j[map_act['Inside Front']].values
+        t_of_start, t_of_end = get_window(sig_of, t_up, t_ae)
+        t_if_start, t_if_end = get_window(sig_if, t_of_start+1.5, t_ae)
+        corner_stats['Outside Front'] = (t_of_start, t_of_end)
+        corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # B. REAR (Lean-Away Logic)
-        ir = df_j[map_act['Inside Rear']].values
-        or_ = df_j[map_act['Outside Rear']].values
-        fy_ir = df_j[map_fy['Inside Rear']].values
+        # B. REAR (Valley Logic)
+        sig_ir = df_j[map_act['Inside Rear']].values
+        sig_or = df_j[map_act['Outside Rear']].values
         
-        # 1. OR Start (Gun Spike)
-        # Helper to find acceleration spike
-        def find_spike(sig, start_g):
-            mask = (times_j >= start_g)
-            if not np.any(mask): return start_g
-            s = sig[mask]; t = times_j[mask]
-            grad = np.gradient(s)
-            thresh = np.max(grad) * 0.3
-            spikes = np.where(grad > thresh)[0]
-            if len(spikes)>0: return t[spikes[0]]
-            return start_g
-            
-        ts_or = find_spike(or_, t_up + 2.5)
-        # Safety fallback if spike not found
-        if ts_or == t_up + 2.5: ts_or, _ = get_window(or_, t_up+2.5, t_ae, 0.5)
+        # 1. Get approximate active window for WHOLE rear side
+        # (Since IR and OR are separate zones, we analyze their relationship)
+        t_ir_start_raw, _ = get_window(sig_ir, t_up, t_ae, 0.15)
+        t_or_start_raw, t_or_end = get_window(sig_or, t_up + 2.5, t_ae, 0.4)
         
-        _, te_or = get_window(or_, ts_or, t_ae, 0.2)
+        # 2. Find the VALLEY between IR Start and OR End
+        # We assume the transition happens at the point of LOWEST combined activity
+        # in the middle of the sequence.
         
-        # 2. IR Start
-        ts_ir, _ = get_window(ir, t_up, t_ae, 0.15)
+        search_s = t_ir_start_raw + 1.5 # Give IR time to work
+        search_e = t_or_start_raw       # Up to OR start
         
-        # 3. IR END (The "Lean")
-        # Look for Negative Fy (Upward Motion) in the IR zone
-        # Search from 2.0s after start
-        mask_lean = (times_j >= ts_ir + 2.0) & (times_j <= ts_or)
-        if np.any(mask_lean):
-            fy_lean = fy_ir[mask_lean]
-            t_lean = times_j[mask_lean]
-            
-            # "Leaning Away" = Movement towards top of screen = Negative Y
-            # Find the first moment it dips below -0.5 (significant move)
-            lean_indices = np.where(fy_lean < -0.5)[0]
-            
-            if len(lean_indices) > 0:
-                te_ir = t_lean[lean_indices[0]]
-            else:
-                # No clear lean found, fallback to OR start minus transit
-                te_ir = ts_or - 1.4
+        t_ir_end = t_ir_start_raw + 2.0 # Default fallback
+        t_or_start = t_or_start_raw
+        
+        if search_e > search_s:
+            mask_valley = (times_j >= search_s) & (times_j <= search_e)
+            if np.any(mask_valley):
+                # Look at Inside Rear signal specifically
+                # We want to find where it DIPS before the OR starts
+                s_valley = sig_ir[mask_valley]
+                t_valley = times_j[mask_valley]
+                
+                # Find local minimum (The Valley)
+                min_idx = np.argmin(s_valley)
+                t_valley_point = t_valley[min_idx]
+                
+                # Also check Vertical Flow (Lean) near that valley
+                fy_ir = df_j[map_fy['Inside Rear']].values
+                fy_valley_seq = fy_ir[mask_valley]
+                
+                # Did he move UP (neg Y) near the valley?
+                min_fy_idx = np.argmin(fy_valley_seq) # Most negative vertical speed
+                t_lean = t_valley[min_fy_idx]
+                
+                # If the lean is strong, prefer that. Else use activity dip.
+                if fy_valley_seq[min_fy_idx] < -0.5:
+                    t_ir_end = t_lean
+                else:
+                    t_ir_end = t_valley_point
+                    
+                # The Transition starts at IR End
+                # The Outside Rear starts when activity picks up (t_or_start_raw)
+                
+        # Consistency Checks
+        if t_ir_end > t_or_start_raw:
+             # Overlap? Force separate
+             mid = (t_ir_start_raw + t_or_end) / 2
+             t_ir_end = mid - 0.5
+             t_or_start = mid + 0.5
         else:
-            te_ir = ts_or - 1.4
-            
-        # Force Transition continuity
-        t_trans_start = te_ir
-        t_trans_end = ts_or
-        
-        # Clamps
-        if te_ir < ts_ir + 1.5: te_ir = ts_ir + 1.5
-        if t_trans_end < t_trans_start: t_trans_end = t_trans_start + 0.1
-            
-        corner_stats['Inside Rear'] = (ts_ir, te_ir)
-        corner_stats['Rear Transition'] = (t_trans_start, t_trans_end)
-        corner_stats['Outside Rear'] = (ts_or, te_or)
+             t_or_start = t_or_start_raw
+
+        corner_stats['Inside Rear'] = (t_ir_start_raw, t_ir_end)
+        corner_stats['Rear Transition'] = (t_ir_end, t_or_start)
+        corner_stats['Outside Rear'] = (t_or_start, t_or_end)
 
     # 4. FUEL
     t_fuel_start, t_fuel_end = None, None
@@ -392,10 +392,10 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
             sc = row.get('Probe_Match_Sm', 0.0)
             cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
             
-            # Visualize Vertical Flow for IR
-            if "Fy_BL_Sm" in df.columns: # Assuming L->R arrival
-                fy = row["Fy_BL_Sm"]
-                cv2.putText(frame, f"Fy_IR: {fy:.2f}", (width-430, 350), 0, 0.5, (0,255,0), 1)
+            fb = row.get('Fuel_Box')
+            if fb is not None and not pd.isna(fb):
+                x,y,w,h = fb
+                cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,255), 2)
 
         out.write(frame)
         frame_idx += 1
@@ -407,9 +407,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V57")
-    st.markdown("### Lean-Away Vector Logic")
-    st.info("Inside Rear end is triggered by the 'Lean' (Negative Vertical Flow) as the mechanic pushes off to transition.")
+    st.title("🏁 Pit Stop Analyzer V58")
+    st.markdown("### Valley Detection Logic")
+    st.info("Identifies the lowest activity point (Valley) between IR and OR to mark the transition cut-off.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -432,11 +432,11 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (Directional Flow)...")
+            st.write("Step 1: Extraction (Multi-Template)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v57(df, fps)
+            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v58(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -487,7 +487,7 @@ def main():
             with c2:
                 if os.path.exists(vid_path):
                     with open(vid_path, 'rb') as f:
-                        st.download_button("Download MP4", f, file_name="pitstop_v57.mp4")
+                        st.download_button("Download MP4", f, file_name="pitstop_v58.mp4")
         else:
             st.warning("Please re-run analysis.")
 
