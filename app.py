@@ -19,24 +19,19 @@ def load_model():
     return YOLO('yolov8n.pt')
 
 def load_templates(folder_name):
-    """Loads ALL images from a folder to use as templates."""
     templates = []
-    # Check both structured and flat paths
-    paths_to_check = [
-        os.path.join(BASE_DIR, "refs", folder_name, "*"),
-        os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
-    ]
-    
-    for p in paths_to_check:
-        files = glob.glob(p)
-        for f in files:
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif')):
-                img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-                if img is not None: 
-                    templates.append(img)
+    path = os.path.join(BASE_DIR, "refs", folder_name, "*")
+    files = glob.glob(path)
+    if not files:
+        path = os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
+        files = glob.glob(path)
+    for f in files:
+        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif')):
+            img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+            if img is not None: templates.append(img)
     return templates
 
-# --- PASS 1: Extraction (Focused Port Logic) ---
+# --- PASS 1: Extraction ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -47,23 +42,22 @@ def extract_telemetry(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Load ALL Reference Templates
     temps_in = load_templates("probein")
     temps_out = load_templates("probeout")
     temps_empty = load_templates("emptyfuelport")
     
     telemetry_data = []
     
-    # Optical Flow ROI
     g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
-    mid_x = int((g_x2 - g_x1) / 2)
     
     ret, prev_frame = cap.read()
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     prev_roi = prev_gray[g_y1:g_y2, g_x1:g_x2]
     
     frame_idx = 0
+    latched_car_box = None
+    car_stable_count = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -72,7 +66,7 @@ def extract_telemetry(video_path, progress_callback):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         curr_roi = gray[g_y1:g_y2, g_x1:g_x2]
         
-        # 1. Optical Flow
+        # 1. Flow
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         fx = flow[..., 0]
         mag = np.sqrt(fx**2 + flow[..., 1]**2)
@@ -80,6 +74,7 @@ def extract_telemetry(video_path, progress_callback):
         flow_x = np.median(fx[active]) if np.any(active) else 0.0
         
         # 2. Zoom
+        mid_x = (g_x2 - g_x1) // 2
         f_left = fx[:, :mid_x]
         f_right = fx[:, mid_x:]
         val_l = np.median(f_left[np.abs(f_left)>0.5]) if np.any(np.abs(f_left)>0.5) else 0.0
@@ -95,116 +90,83 @@ def extract_telemetry(video_path, progress_callback):
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
-        # 4. FUEL (Focused Search)
+        # 4. Fuel & Detection
         score_in = 0.0
         score_out = 0.0
         score_empty = 0.0
         fueler_present = 0
-        fuel_box = None # The computed focus zone
+        fuel_box = None
+        current_car_box = None
+        person_tracks = []
         
         results = model.track(frame, persist=True, classes=[0, 2], verbose=False, conf=0.15)
-        car_box = None
-        people_boxes = []
         
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
             cls = results[0].boxes.cls.cpu().numpy()
             ids = results[0].boxes.id.cpu().numpy()
             
-            # Find Car
+            # Car
             car_indices = [i for i, c in enumerate(cls) if int(c) == 2]
             if car_indices:
-                # Valid car not on wall
                 valid_cars = [i for i in car_indices if boxes[i][1] < height * 0.9]
                 if valid_cars:
                     best_car = max(valid_cars, key=lambda i: boxes[i][2]*boxes[i][3])
-                    car_box = boxes[best_car] 
-
-            # Find People
-            for i, c in enumerate(cls):
-                if int(c) == 0: people_boxes.append(boxes[i])
-
-        if car_box is not None:
-            cx, cy, cw, ch = car_box
-            
-            # Step A: Define Broad Search Area (Car Body)
-            x1, x2 = int(cx - cw/2), int(cx + cw/2)
-            y1, y2 = int(cy - ch/2), int(cy + ch/2)
-            
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(width, x2), min(height, y2)
-            
-            if x2 > x1 and y2 > y1:
-                car_img = gray[y1:y2, x1:x2]
-                
-                # Step B: LOCATE PORT
-                # Search for 'Empty Port' template inside the car body to find exact location
-                best_port_score = 0.0
-                best_port_loc = None
-                port_w, port_h = 0, 0
-                
-                # Try all empty templates to find where the port is
-                for t in temps_empty:
-                    if car_img.shape[0] >= t.shape[0] and car_img.shape[1] >= t.shape[1]:
-                        res = cv2.matchTemplate(car_img, t, cv2.TM_CCOEFF_NORMED)
-                        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                        if max_val > best_port_score:
-                            best_port_score = max_val
-                            best_port_loc = max_loc
-                            port_w, port_h = t.shape[1], t.shape[0]
-                
-                # Step C: DEFINE FOCUS ZONE
-                # If we found the port, focus there. If not (maybe obstructed), use broader search.
-                if best_port_score > 0.4: # Low threshold just to find location
-                    px, py = best_port_loc
-                    # Define Focus Zone: The port location + padding
-                    pad = 30
-                    fx1 = max(0, x1 + px - pad)
-                    fy1 = max(0, y1 + py - pad)
-                    fx2 = min(width, x1 + px + port_w + pad)
-                    fy2 = min(height, y1 + py + port_h + pad)
+                    current_car_box = boxes[best_car]
                     
-                    fuel_box = (fx1, fy1, fx2-fx1, fy2-fy1)
-                    focus_zone = gray[fy1:fy2, fx1:fx2]
-                else:
-                    # Fallback: Use center-bottom of car
-                    # (Assuming port is on the side facing camera/crew)
-                    fx1 = int(cx - cw/4)
-                    fx2 = int(cx + cw/4)
-                    fy1 = int(cy)
-                    fy2 = int(cy + ch/2)
-                    fuel_box = (fx1, fy1, fx2-fx1, fy2-fy1)
-                    focus_zone = gray[fy1:fy2, fx1:fx2]
+                    if abs(flow_x) < 0.5:
+                        car_stable_count += 1
+                        if car_stable_count > 5: latched_car_box = current_car_box
+                    else:
+                        car_stable_count = 0
 
-                # Step D: DETECT PROBE IN/OUT (In Focus Zone)
-                # Check IN
-                for t in temps_in:
-                    if focus_zone.shape[0] >= t.shape[0] and focus_zone.shape[1] >= t.shape[1]:
-                        res = cv2.matchTemplate(focus_zone, t, cv2.TM_CCOEFF_NORMED)
-                        score_in = max(score_in, cv2.minMaxLoc(res)[1])
-                        
-                # Check OUT
-                for t in temps_out:
-                    if focus_zone.shape[0] >= t.shape[0] and focus_zone.shape[1] >= t.shape[1]:
-                        res = cv2.matchTemplate(focus_zone, t, cv2.TM_CCOEFF_NORMED)
-                        score_out = max(score_out, cv2.minMaxLoc(res)[1])
-                        
-                # Check EMPTY (Current Score)
-                for t in temps_empty:
-                    if focus_zone.shape[0] >= t.shape[0] and focus_zone.shape[1] >= t.shape[1]:
-                        res = cv2.matchTemplate(focus_zone, t, cv2.TM_CCOEFF_NORMED)
-                        score_empty = max(score_empty, cv2.minMaxLoc(res)[1])
+            if current_car_box is None and latched_car_box is not None:
+                current_car_box = latched_car_box
+                
+            # Fuel Search
+            if current_car_box is not None:
+                cx, cy, cw, ch = current_car_box
+                margin = 10
+                x1 = int(cx - cw/4) - margin
+                x2 = int(cx + cw/4) + margin
+                y1 = int(cy)
+                y2 = int(cy + ch/2) + margin
+                
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                
+                if (x2 > x1) and (y2 > y1):
+                    fuel_zone = gray[y1:y2, x1:x2]
+                    fuel_box = (x1, y1, x2-x1, y2-y1)
+                    
+                    # Template Matching
+                    for t in temps_in:
+                        if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            score_in = max(score_in, cv2.minMaxLoc(res)[1])
+                    for t in temps_out:
+                        if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            score_out = max(score_out, cv2.minMaxLoc(res)[1])
+                    for t in temps_empty:
+                        if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            score_empty = max(score_empty, cv2.minMaxLoc(res)[1])
 
-                # Step E: Check Fueler Presence
-                # Does a person overlap the Fuel Box?
-                if fuel_box:
-                    fx, fy, fw, fh = fuel_box
-                    for p in people_boxes:
-                        px, py, pw, ph = p
-                        # Simple center check
-                        if (fx < px < fx+fw) and (fy < py < fy+fh):
-                            fueler_present = 1
-                            break
+            # People
+            for i, c in enumerate(cls):
+                if int(c) == 0:
+                    if boxes[i][1] < height * 0.95:
+                        person_tracks.append((int(ids[i]), boxes[i][0], boxes[i][1], boxes[i][2], boxes[i][3]))
+
+            # Check Fueler Overlap
+            if fuel_box:
+                fx, fy, fw, fh = fuel_box
+                for p in person_tracks:
+                    px, py = p[1], p[2]
+                    if (fx < px < fx+fw) and (fy < py < fy+fh):
+                        fueler_present = 1
+                        break
 
         telemetry_data.append({
             "Frame": frame_idx,
@@ -218,8 +180,8 @@ def extract_telemetry(video_path, progress_callback):
             "Fuel_Box": fuel_box,
             "Act_TL": act_tl, "Act_TR": act_tr,
             "Act_BL": act_bl, "Act_BR": act_br,
-            "Person_Tracks": people_boxes,
-            "Car_Box": car_box
+            "Person_Tracks": person_tracks,
+            "Car_Box": current_car_box
         })
         
         prev_roi = curr_roi
@@ -229,8 +191,8 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V69 ---
-def analyze_states_v69(df, fps):
+# --- PASS 2: Analysis V70 (Fixed Scope) ---
+def analyze_states_v70(df, fps):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'S_In', 'S_Out', 'S_Empty', 'Fueler_Present', 
             'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
@@ -245,6 +207,9 @@ def analyze_states_v69(df, fps):
 
     df['Zoom_Vel'] = np.gradient(df['Zoom_Score_Sm'])
 
+    # Initialize IDs to avoid UnboundLocalError
+    crew_ids = {'Rear_Changer': None, 'Front_Changer': None}
+
     # 1. PIT STOP
     x_mag = df['Flow_X_Sm'].abs()
     peaks, _ = find_peaks(x_mag, height=x_mag.max()*0.3, distance=fps*5)
@@ -257,12 +222,13 @@ def analyze_states_v69(df, fps):
         arr_flow = df['Flow_X_Sm'].iloc[arrival_idx]
         arrival_dir = 1 if arr_flow > 0 else -1 
         
+        STOP_THRESH = x_mag.max() * 0.05
         for i in range(arrival_idx, depart_idx):
-            if x_mag.iloc[i] < x_mag.max()*0.05:
+            if x_mag.iloc[i] < STOP_THRESH:
                 t_start = df.iloc[i]['Time']
                 break
         for i in range(depart_idx, arrival_idx, -1):
-            if x_mag.iloc[i] < x_mag.max()*0.05:
+            if x_mag.iloc[i] < STOP_THRESH:
                 t_end = df.iloc[i]['Time']
                 break
 
@@ -339,13 +305,11 @@ def analyze_states_v69(df, fps):
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
         
-        # Rear (Force Transition)
+        # Rear
         ir = df_j[map_corners['Inside Rear']].values
         or_ = df_j[map_corners['Outside Rear']].values
         
-        # OR Start (Gun Spike Logic: 0.55)
         t_or_start, t_or_end = get_window(or_, t_up+2.5, t_ae, 0.55)
-        # IR Start (Sensitive: 0.15)
         t_ir_start, t_ir_raw_end = get_window(ir, t_up, t_ae, 0.15)
         
         if t_or_start > t_up + 3.0:
@@ -363,8 +327,44 @@ def analyze_states_v69(df, fps):
         corner_stats['Inside Rear'] = (t_ir_start, t_ir_end)
         corner_stats['Rear Transition'] = (t_trans_start, t_trans_end)
         corner_stats['Outside Rear'] = (t_or_start, t_or_end)
+        
+        # --- ID ASSIGNMENT ---
+        valid_car_frames = df[df['Car_Box'].notnull()]
+        if not valid_car_frames.empty:
+            ref_row = valid_car_frames.iloc[len(valid_car_frames)//2]
+            cx, cy, cw, ch = ref_row['Car_Box']
+            margin = 60
+            
+            # Define zones based on arrival direction
+            if arrival_dir > 0:
+                zr_x1, zr_y1 = int(cx - cw/2 - margin), int(cy + ch/2 - margin)
+                zr_x2, zr_y2 = int(cx - cw/2 + margin*2), int(cy + ch/2 + margin*2)
+                zf_x1, zf_y1 = int(cx + cw/2 - margin), int(cy - ch/2 - margin*2)
+                zf_x2, zf_y2 = int(cx + cw/2 + margin), int(cy - ch/2 + margin)
+            else:
+                zr_x1, zr_y1 = int(cx + cw/2 - margin), int(cy + ch/2 - margin)
+                zr_x2, zr_y2 = int(cx + cw/2 + margin), int(cy + ch/2 + margin*2)
+                zf_x1, zf_y1 = int(cx - cw/2 - margin), int(cy - ch/2 - margin*2)
+                zf_x2, zf_y2 = int(cx - cw/2 + margin), int(cy - ch/2 + margin)
+            
+            def find_id(t_s, t_e, box):
+                bx1, by1, bx2, by2 = box
+                counts = Counter()
+                mask = (df['Time'] >= t_s) & (df['Time'] <= t_e)
+                rows = df[mask]
+                for _, r in rows.iterrows():
+                    tracks = r['Person_Tracks']
+                    if isinstance(tracks, list):
+                        for (pid, px, py, pw, ph) in tracks:
+                            if bx1 < px < bx2 and by1 < py < by2:
+                                counts[pid] += 1
+                if counts: return counts.most_common(1)[0][0]
+                return None
 
-    # 4. FUEL (Logic V69: Multi-Reference & Person Gate)
+            crew_ids['Rear_Changer'] = find_id(t_ir_start, t_ir_end, (zr_x1, zr_y1, zr_x2, zr_y2))
+            crew_ids['Front_Changer'] = find_id(t_of_start, t_of_end, (zf_x1, zf_y1, zf_x2, zf_y2))
+
+    # 4. FUEL
     t_fuel_start, t_fuel_end = None, None
     if t_start and t_end:
         fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
@@ -375,13 +375,10 @@ def analyze_states_v69(df, fps):
             person = fuel_w['Fueler_Present_Sm'].values
             times = fuel_w['Time'].values
             
-            # Logic: Person Present AND (In > Out OR In > Empty) AND In > 0.5
-            # Lowered 'In' threshold to 0.5 since we have spatial focus now
             is_fueling = (person > 0.5) & (s_in > 0.5) & ((s_in > s_out) | (s_in > s_emp))
-            
             indices = np.where(is_fueling)[0]
             
-            if len(indices) > int(fps * 1.5): # 1.5s persistence
+            if len(indices) > int(fps * 1.5):
                 t_fuel_start = times[indices[0]]
                 diffs = np.diff(indices)
                 splits = np.where(diffs > 20)[0]
@@ -439,37 +436,35 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, crew_ids, df, fps,
         cv2.putText(frame, "TIRES (Total)", (width-430, 140), 0, 0.8, (255,255,255), 2)
         cv2.putText(frame, f"{vt:.2f}s", (width-180, 140), 0, 1.2, ct, 3)
 
+        # Corners
         start_y = 180
         gap_y = 30
-        trans_start, trans_end = corner_data.get("Rear Transition", (0,0))
-        
-        labels_ui = [
-            ("Inside Rear", "Inside Rear"),
-            ("TRANSITION", "  > Transition"),
-            ("Outside Rear", "Outside Rear"),
-            ("Outside Front", "Outside Front"),
-            ("Front Transition", "  > F-Transition"),
-            ("Inside Front", "Inside Front")
-        ]
-        
-        for i, (key, display) in enumerate(labels_ui):
-            y_pos = start_y + (i*gap_y)
-            
-            if "Transition" in key:
-                c_start, c_end = corner_data.get(key, (0.0, 0.0))
-                label_col = (255, 255, 0)
-            else:
-                c_start, c_end = corner_data.get(key, (0.0, 0.0))
-                label_col = (255, 255, 255)
-            
+        for i, label in enumerate(labels):
+            c_start, c_end = corner_data.get(label, (0.0, 0.0))
             c_val = 0.0
             if c_start > 0 and curr >= c_start:
                 val = (c_end - c_start) if (curr >= c_end) else (curr - c_start)
                 c_val = max(0.0, val)
-            
-            txt_col = label_col if c_val > 0 else (100,100,100)
-            cv2.putText(frame, display, (width-430, y_pos), 0, 0.6, txt_col, 1)
+            txt_col = (255,255,255) if c_val > 0 else (150,150,150)
+            y_pos = start_y + (i*gap_y)
+            cv2.putText(frame, label, (width-430, y_pos), 0, 0.6, txt_col, 1)
             cv2.putText(frame, f"{c_val:.2f}s", (width-100, y_pos), 0, 0.6, txt_col, 2)
+
+        # Crew Labels
+        if frame_idx < len(df):
+            row = df.iloc[frame_idx]
+            tracks = row.get('Person_Tracks')
+            if isinstance(tracks, list):
+                for (pid, x, y, w, h) in tracks:
+                    lbl = None
+                    color = (200,200,200)
+                    if pid == crew_ids.get('Rear_Changer'):
+                        lbl = "Rear Changer"; color = (0,255,0)
+                    elif pid == crew_ids.get('Front_Changer'):
+                        lbl = "Front Changer"; color = (0,165,255)
+                    if lbl:
+                        cv2.rectangle(frame, (int(x-w/2), int(y-h/2)), (int(x+w/2), int(y+h/2)), color, 2)
+                        cv2.putText(frame, lbl, (int(x-w/2), int(y-h/2)-5), 0, 0.5, color, 1)
 
         if show_debug:
             safe_idx = min(frame_idx, len(df)-1)
@@ -493,9 +488,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, crew_ids, df, fps,
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V69")
-    st.markdown("### Focused Fuel Tracking")
-    st.info("Fuel logic now locates the port first, then monitors that specific zone. Scans all templates.")
+    st.title("🏁 Pit Stop Analyzer V70")
+    st.markdown("### Fixed Variable Scope")
+    st.info("Corrected 'crew_ids not defined' error. Restored crew tracking logic.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -518,11 +513,11 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (Focused Port Search)...")
+            st.write("Step 1: Extraction (Flow, Zoom, Fuel)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners, crew_ids, df_final = analyze_states_v69(df, fps)
+            pit_t, tire_t, fuel_t, corners, crew_ids, df_final = analyze_states_v70(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -577,7 +572,7 @@ def main():
             with c2:
                 if os.path.exists(vid_path):
                     with open(vid_path, 'rb') as f:
-                        st.download_button("Download MP4", f, file_name="pitstop_v69.mp4")
+                        st.download_button("Download MP4", f, file_name="pitstop_v70.mp4")
         else:
             st.warning("Please re-run analysis.")
 
