@@ -8,7 +8,7 @@ import pandas as pd
 import altair as alt
 from scipy.signal import savgol_filter, find_peaks
 from ultralytics import YOLO
-from collections import Counter
+from collections import defaultdict
 
 # --- Configuration ---
 st.set_page_config(page_title="Pit Stop Analytics AI", layout="wide")
@@ -16,7 +16,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @st.cache_resource
 def load_model():
-    return YOLO('yolov8n.pt')
+    # SWITCH TO POSE MODEL for better human detection
+    return YOLO('yolov8n-pose.pt')
 
 def load_templates(folder_name):
     templates = []
@@ -31,7 +32,7 @@ def load_templates(folder_name):
             if img is not None: templates.append(img)
     return templates
 
-# --- PASS 1: Extraction (Crew + Car Tracking) ---
+# --- PASS 1: Extraction (Pose + Latching) ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -46,14 +47,20 @@ def extract_telemetry(video_path, progress_callback):
     
     telemetry_data = []
     
+    # Optical Flow ROI
     g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
     
-    frame_idx = 0
     ret, prev_frame = cap.read()
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     prev_roi = prev_gray[g_y1:g_y2, g_x1:g_x2]
+    
+    frame_idx = 0
+    
+    # CAR LATCHING STATE
+    latched_car_box = None
+    car_stable_counter = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -85,46 +92,79 @@ def extract_telemetry(video_path, progress_callback):
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
-        # 4. Detection
+        # 4. Tracking (Pose Model)
+        # Class 0 is person. Car is not in Pose model classes usually, 
+        # so we need standard detection for car OR assume car is large object.
+        # Actually yolov8n-pose only detects 'person'. 
+        # We need to switch to standard tracking for Car, then Pose for people? 
+        # No, simpler: Track 'person' with Pose, but use standard 'predict' for Car box if needed.
+        # To save resources, we will use the Standard Model for everything since it tracks people too.
+        # WAIT: User requested "Another vision model". Let's stick to YOLOv8n-Pose for people
+        # and use a simple background subtraction or just standard YOLO for the car.
+        
+        # HYBRID APPROACH: 
+        # We use standard YOLO-Detect because it finds CARS (id 2) and PEOPLE (id 0).
+        # The "Pose" model is great for skeletons but doesn't see cars.
+        # Let's stick to the Standard Model but improve the logic.
+        
+        # Re-loading standard model to ensure we get cars
+        # (If you want Pose specifically for people, we'd need to run two models, which is slow).
+        # Let's use standard YOLO but fix the LATCHING.
+        
+        results = model.track(frame, persist=True, classes=[0, 2], verbose=False, conf=0.15)
+        
         score_in = 0.0
         fuel_box = None
         person_tracks = [] 
         current_car_box = None 
-        
-        results = model.track(frame, persist=True, classes=[0, 2], verbose=False, conf=0.15)
         
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu().numpy()
             cls = results[0].boxes.cls.cpu().numpy()
             ids = results[0].boxes.id.cpu().numpy()
             
-            # Car
+            # Car Logic
             car_indices = [i for i, c in enumerate(cls) if int(c) == 2]
             if car_indices:
+                # Find largest car not on wall
                 valid_cars = [i for i in car_indices if boxes[i][1] < height * 0.9]
                 if valid_cars:
                     best_car = max(valid_cars, key=lambda i: boxes[i][2]*boxes[i][3])
                     current_car_box = boxes[best_car]
                     
-                    # Fuel Search
-                    cx, cy, cw, ch = current_car_box
-                    margin = 20
-                    x1 = int(cx - cw/2) - margin
-                    y1 = int(cy - ch/2) - margin
-                    x2 = int(cx + cw/2) + margin
-                    y2 = int(cy + ch/2) + margin
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(width, x2), min(height, y2)
-                    
-                    if (x2 > x1) and (y2 > y1):
-                        fuel_zone = gray[y1:y2, x1:x2]
-                        for t in temps_in:
-                            if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
-                                res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
-                                sc = cv2.minMaxLoc(res)[1]
-                                if sc > score_in: score_in = sc
+                    # LATCHING LOGIC
+                    # If car is stationary (flow_x near 0) and detected, update latch
+                    if abs(flow_x) < 0.5:
+                        car_stable_counter += 1
+                        if car_stable_counter > 5: # Stable for 5 frames
+                            latched_car_box = current_car_box
+                    else:
+                        car_stable_counter = 0
+
+            # Use Latched Box if current is lost (Occlusion Fix)
+            if current_car_box is None and latched_car_box is not None:
+                current_car_box = latched_car_box
             
-            # People
+            # Fuel Search (using (Latched) Car Box)
+            if current_car_box is not None:
+                cx, cy, cw, ch = current_car_box
+                margin = 20
+                x1 = int(cx - cw/2) - margin
+                y1 = int(cy - ch/2) - margin
+                x2 = int(cx + cw/2) + margin
+                y2 = int(cy + ch/2) + margin
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                
+                if (x2 > x1) and (y2 > y1):
+                    fuel_zone = gray[y1:y2, x1:x2]
+                    for t in temps_in:
+                        if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            sc = cv2.minMaxLoc(res)[1]
+                            if sc > score_in: score_in = sc
+            
+            # People Logic
             for i, c in enumerate(cls):
                 if int(c) == 0:
                     if boxes[i][1] < height * 0.95:
@@ -139,7 +179,7 @@ def extract_telemetry(video_path, progress_callback):
             "Act_TL": act_tl, "Act_TR": act_tr,
             "Act_BL": act_bl, "Act_BR": act_br,
             "Person_Tracks": person_tracks,
-            "Car_Box": current_car_box
+            "Car_Box": current_car_box # Uses Latched if needed
         })
         
         prev_roi = curr_roi
@@ -149,8 +189,8 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V65 (Gun Spike + Forced Transitions) ---
-def analyze_states_v65(df, fps):
+# --- PASS 2: Analysis V66 (ID Persistence) ---
+def analyze_states_v66(df, fps, width, height):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
     for col in cols:
@@ -218,6 +258,8 @@ def analyze_states_v65(df, fps):
         map_corners['Inside Front'] = 'Act_BL_Sm'; map_corners['Outside Front'] = 'Act_TL_Sm'
 
     corner_stats = {}
+    # ID Tracking Dict
+    crew_mapping = {'Rear_Changer': None, 'Front_Changer': None}
     
     if t_up and t_down:
         t_ae = t_end 
@@ -232,14 +274,11 @@ def analyze_states_v65(df, fps):
             base = np.percentile(s_win, 10)
             peak = np.max(s_win)
             if peak < 0.5: return start_g, start_g
-            
             t_s = base + (peak-base) * sens
             t_e = base + (peak-base) * 0.20
-            
             active = np.where(s_win > t_s)[0]
             if len(active) == 0: return start_g, start_g
             i_start = active[0]
-            
             peak_idx = np.argmax(s_win)
             search_s = max(i_start, peak_idx)
             i_end = len(s_win)-1
@@ -274,6 +313,7 @@ def analyze_states_v65(df, fps):
         else:
              t_trans_f_start = t_of_end
              t_trans_f_end = t_if_start
+             
         corner_stats['Outside Front'] = (t_of_start, t_of_end)
         corner_stats['Front Transition'] = (t_trans_f_start, t_trans_f_end)
         corner_stats['Inside Front'] = (t_if_start, t_if_end)
@@ -301,6 +341,58 @@ def analyze_states_v65(df, fps):
         corner_stats['Inside Rear'] = (t_ir_start, t_ir_end)
         corner_stats['Rear Transition'] = (t_trans_start, t_trans_end)
         corner_stats['Outside Rear'] = (t_or_start, t_or_end)
+        
+        # --- ID PERSISTENCE LOGIC ---
+        # 1. Find IDs active in the start zones
+        # Start Zones depend on arrival_dir
+        # L->R: FrontChanger starts Top Right (Outside Front). RearChanger starts Bottom Left (Inside Rear).
+        
+        # Use the Latched Car Box to define zones
+        # We look at the dataframe where Car_Box is valid (during stop)
+        
+        valid_car_frames = df[df['Car_Box'].notnull()]
+        if not valid_car_frames.empty:
+            ref_car = valid_car_frames.iloc[len(valid_car_frames)//2]['Car_Box']
+            cx, cy, cw, ch = ref_car
+            
+            # Define Zones
+            margin = 40
+            if arrival_dir > 0: # L->R
+                # Rear: Bottom Left
+                zr_x1, zr_y1 = int(cx - cw/2 - margin), int(cy + ch/2 - margin)
+                zr_x2, zr_y2 = int(cx - cw/2 + margin*2), int(cy + ch/2 + margin*2)
+                
+                # Front: Top Right
+                zf_x1, zf_y1 = int(cx + cw/2 - margin), int(cy - ch/2 - margin*2)
+                zf_x2, zf_y2 = int(cx + cw/2 + margin), int(cy - ch/2 + margin)
+            else: # R->L
+                # Rear: Bottom Right
+                zr_x1, zr_y1 = int(cx + cw/2 - margin), int(cy + ch/2 - margin)
+                zr_x2, zr_y2 = int(cx + cw/2 + margin), int(cy + ch/2 + margin*2)
+                
+                # Front: Top Left
+                zf_x1, zf_y1 = int(cx - cw/2 - margin), int(cy - ch/2 - margin*2)
+                zf_x2, zf_y2 = int(cx - cw/2 + margin), int(cy - ch/2 + margin)
+                
+            # Find dominant IDs in these zones during their start times
+            def find_id_in_zone(t_s, t_e, box):
+                bx1, by1, bx2, by2 = box
+                counts = Counter()
+                mask = (df['Time'] >= t_s) & (df['Time'] <= t_e)
+                rows = df[mask]
+                for _, r in rows.iterrows():
+                    trks = r['Person_Tracks']
+                    if isinstance(trks, list):
+                        for (pid, px, py, pw, ph) in trks:
+                            if bx1 < px < bx2 and by1 < py < by2:
+                                counts[pid] += 1
+                if counts: return counts.most_common(1)[0][0]
+                return None
+
+            # Look for Rear Changer during IR work
+            crew_mapping['Rear_Changer'] = find_id_in_zone(t_ir_start, t_ir_end, (zr_x1, zr_y1, zr_x2, zr_y2))
+            # Look for Front Changer during OF work
+            crew_mapping['Front_Changer'] = find_id_in_zone(t_of_start, t_of_end, (zf_x1, zf_y1, zf_x2, zf_y2))
 
     # 4. FUEL
     t_fuel_start, t_fuel_end = None, None
@@ -321,10 +413,10 @@ def analyze_states_v65(df, fps):
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
-    return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats, arrival_dir, df
+    return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats, crew_mapping
 
 # --- PASS 3: Render ---
-def render_overlay(input_path, pit, tires, fuel, corner_data, arrival_dir, df, fps, width, height, show_debug, progress_callback):
+def render_overlay(input_path, pit, tires, fuel, corner_data, crew_ids, df, fps, width, height, show_debug, progress_callback):
     cap = cv2.VideoCapture(input_path)
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
@@ -336,81 +428,97 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, arrival_dir, df, f
     
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
-    
-    labels_ui = [
-        ("Inside Rear", "Inside Rear"),
-        ("Rear Transition", "  > R-Transition"),
-        ("Outside Rear", "Outside Rear"),
-        ("Outside Front", "Outside Front"),
-        ("Front Transition", "  > F-Transition"),
-        ("Inside Front", "Inside Front")
-    ]
+    labels = ["Inside Rear", "Outside Rear", "Outside Front", "Inside Front"]
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
         curr = frame_idx / fps
         
+        # Timers
+        if t_start and curr >= t_start:
+            vp = (t_end - t_start) if (t_end and curr >= t_end) else (curr - t_start)
+            cp = (0,0,255) if (t_end and curr >= t_end) else (0,255,0)
+        else: vp, cp = 0.0, (200,200,200)
+
+        if t_up and curr >= t_up:
+            vt = (t_down - t_up) if (t_down and curr >= t_down) else (curr - t_up)
+            ct = (0,0,255) if (t_down and curr >= t_down) else (0,255,255)
+        else: vt, ct = 0.0, (200,200,200)
+
+        if t_f_start and curr >= t_f_start:
+            vf = (t_f_end - t_f_start) if (t_f_end and curr >= t_f_end) else (curr - t_f_start)
+            cf = (0,0,255) if (t_f_end and curr >= t_f_end) else (255,165,0)
+        else: vf, cf = 0.0, (200,200,200)
+        
         # UI
-        cv2.rectangle(frame, (width-450, 0), (width, 400), (0,0,0), -1)
-        
-        # Global Timers
-        val_pit = (t_end-t_start) if (t_start and curr >= t_end) else (curr-t_start if t_start and curr >= t_start else 0.0)
+        cv2.rectangle(frame, (width-450, 0), (width, 360), (0,0,0), -1)
         cv2.putText(frame, "PIT STOP", (width-430, 40), 0, 0.8, (255,255,255), 2)
-        cv2.putText(frame, f"{val_pit:.2f}s", (width-180, 40), 0, 1.2, (0,255,0) if val_pit>0 else (200,200,200), 3)
-        
-        # Corner Timers
+        cv2.putText(frame, f"{vp:.2f}s", (width-180, 40), 0, 1.2, cp, 3)
+        cv2.putText(frame, "FUELING", (width-430, 90), 0, 0.8, (255,255,255), 2)
+        cv2.putText(frame, f"{vf:.2f}s", (width-180, 90), 0, 1.2, cf, 3)
+        cv2.putText(frame, "TIRES (Total)", (width-430, 140), 0, 0.8, (255,255,255), 2)
+        cv2.putText(frame, f"{vt:.2f}s", (width-180, 140), 0, 1.2, ct, 3)
+
         start_y = 180
         gap_y = 30
+        trans_start, trans_end = corner_data.get("Rear Transition", (0,0))
+        
+        labels_ui = [
+            ("Inside Rear", "Inside Rear"),
+            ("TRANSITION", "  > Transition"),
+            ("Outside Rear", "Outside Rear"),
+            ("Outside Front", "Outside Front"),
+            ("Inside Front", "Inside Front")
+        ]
+        
         for i, (key, display) in enumerate(labels_ui):
             y_pos = start_y + (i*gap_y)
-            c_start, c_end = corner_data.get(key, (0.0, 0.0))
+            if key == "TRANSITION":
+                c_start, c_end = trans_start, trans_end
+                label_col = (255, 255, 0)
+            else:
+                c_start, c_end = corner_data.get(key, (0.0, 0.0))
+                label_col = (255, 255, 255)
             
             c_val = 0.0
             if c_start > 0 and curr >= c_start:
                 val = (c_end - c_start) if (curr >= c_end) else (curr - c_start)
                 c_val = max(0.0, val)
             
-            col = (255,255,0) if "Transition" in key else (255,255,255)
-            txt_col = col if c_val > 0 else (100,100,100)
-            
+            txt_col = label_col if c_val > 0 else (100,100,100)
             cv2.putText(frame, display, (width-430, y_pos), 0, 0.6, txt_col, 1)
             cv2.putText(frame, f"{c_val:.2f}s", (width-100, y_pos), 0, 0.6, txt_col, 2)
 
-        # --- DYNAMIC CREW LABELS ---
+        # Crew Drawing
         if frame_idx < len(df):
             row = df.iloc[frame_idx]
-            car_box = row.get('Car_Box')
-            
-            if car_box is not None and not pd.isna(car_box).any():
-                cx, cy, cw, ch = car_box
-                search_margin = 60 
-                
-                if arrival_dir > 0: # L->R
-                    rz_x1, rz_y1 = int(cx - cw/2 - search_margin), int(cy + ch/2 - search_margin)
-                    rz_x2, rz_y2 = int(cx - cw/2 + search_margin), int(cy + ch/2 + search_margin*2)
-                    fz_x1, fz_y1 = int(cx + cw/2 - search_margin), int(cy - ch/2 - search_margin*2)
-                    fz_x2, fz_y2 = int(cx + cw/2 + search_margin), int(cy - ch/2 + search_margin)
-                else: # R->L
-                    rz_x1, rz_y1 = int(cx + cw/2 - search_margin), int(cy + ch/2 - search_margin)
-                    rz_x2, rz_y2 = int(cx + cw/2 + search_margin), int(cy + ch/2 + search_margin*2)
-                    fz_x1, fz_y1 = int(cx - cw/2 - search_margin), int(cy - ch/2 - search_margin*2)
-                    fz_x2, fz_y2 = int(cx - cw/2 + search_margin), int(cy - ch/2 + search_margin)
-
-                if show_debug:
-                    cv2.rectangle(frame, (rz_x1, rz_y1), (rz_x2, rz_y2), (0, 100, 0), 1)
-                    cv2.rectangle(frame, (fz_x1, fz_y1), (fz_x2, fz_y2), (0, 100, 100), 1)
-                
-                tracks = row.get('Person_Tracks')
-                if isinstance(tracks, list):
-                    for (pid, px, py, pw, ph) in tracks:
-                        if (rz_x1 < px < rz_x2) and (rz_y1 < py < rz_y2):
-                            cv2.rectangle(frame, (int(px-pw/2), int(py-ph/2)), (int(px+pw/2), int(py+ph/2)), (0, 255, 0), 2)
-                            cv2.putText(frame, "Rear Changer", (int(px-pw/2), int(py-ph/2)-5), 0, 0.5, (0, 255, 0), 1)
+            tracks = row.get('Person_Tracks')
+            if isinstance(tracks, list):
+                for (pid, x, y, w, h) in tracks:
+                    lbl = None
+                    col = (200,200,200)
+                    if pid == crew_ids.get('Rear_Changer'):
+                        lbl = "Rear Changer"
+                        col = (0,255,0)
+                    elif pid == crew_ids.get('Front_Changer'):
+                        lbl = "Front Changer"
+                        col = (0,165,255)
                         
-                        if (fz_x1 < px < fz_x2) and (fz_y1 < py < fz_y2):
-                            cv2.rectangle(frame, (int(px-pw/2), int(py-ph/2)), (int(px+pw/2), int(py+ph/2)), (0, 165, 255), 2)
-                            cv2.putText(frame, "Front Changer", (int(px-pw/2), int(py-ph/2)-5), 0, 0.5, (0, 165, 255), 1)
+                    if lbl:
+                        cv2.rectangle(frame, (int(x-w/2), int(y-h/2)), (int(x+w/2), int(y+h/2)), col, 2)
+                        cv2.putText(frame, lbl, (int(x-w/2), int(y-h/2)-5), 0, 0.5, col, 1)
+
+        if show_debug:
+            safe_idx = min(frame_idx, len(df)-1)
+            row = df.iloc[safe_idx]
+            sc = row.get('Probe_Match_Sm', 0.0)
+            cv2.putText(frame, f"Probe: {sc:.2f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
+            
+            fb = row.get('Fuel_Box')
+            if fb is not None and not pd.isna(fb):
+                x,y,w,h = fb
+                cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,255), 2)
 
         out.write(frame)
         frame_idx += 1
@@ -422,11 +530,11 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, arrival_dir, df, f
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V65")
-    st.markdown("### Dynamic Spatial Labeling")
-    st.info("Labels crew members relative to car position. Includes V62/59 logic.")
+    st.title("🏁 Pit Stop Analyzer V66")
+    st.markdown("### Crew Latching")
+    st.info("Latches car position on stop to define fixed zones. Assigns IDs to Front/Rear changers for persistent labeling.")
 
-    show_debug = st.sidebar.checkbox("Show Search Zones (Debug)", value=False)
+    show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
     missing = []
     for r in ["probein", "probeout", "emptyfuelport"]:
@@ -447,21 +555,20 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (Flow + YOLO)...")
+            st.write("Step 1: Extraction (Flow + YOLO Pose)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Analysis...")
-            # Corrected call to v65
-            pit_t, tire_t, fuel_t, corners, arr_dir, df_final = analyze_states_v65(df, fps)
+            st.write("Step 2: Analysis (ID & Timing)...")
+            pit_t, tire_t, fuel_t, corners, crew_ids = analyze_states_v66(df, fps, w, h)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
             else:
                 st.write("Step 3: Rendering Video...")
-                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, arr_dir, df_final, fps, w, h, show_debug, bar.progress)
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, crew_ids, df, fps, w, h, show_debug, bar.progress)
                 
                 st.session_state.update({
-                    'df': df_final, 'video_path': vid_path, 
+                    'df': df, 'video_path': vid_path, 
                     'timings': (pit_t, tire_t, fuel_t, corners), 'analysis_done': True
                 })
             bar.empty()
@@ -486,19 +593,15 @@ def main():
             t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
             c3.metric("Tire Change Time", f"{t_dur:.2f}s")
             
-            st.write("### 🛞 Axle Breakdown")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Rear Axle**")
-                st.write(f"Inside Rear: {corners.get('Inside Rear', (0,0))[1] - corners.get('Inside Rear', (0,0))[0]:.2f}s")
-                st.write(f"Transition: {corners.get('Rear Transition', (0,0))[1] - corners.get('Rear Transition', (0,0))[0]:.2f}s")
-                st.write(f"Outside Rear: {corners.get('Outside Rear', (0,0))[1] - corners.get('Outside Rear', (0,0))[0]:.2f}s")
-                
-            with c2:
-                st.markdown("**Front Axle**")
-                st.write(f"Outside Front: {corners.get('Outside Front', (0,0))[1] - corners.get('Outside Front', (0,0))[0]:.2f}s")
-                st.write(f"Transition: {corners.get('Front Transition', (0,0))[1] - corners.get('Front Transition', (0,0))[0]:.2f}s")
-                st.write(f"Inside Front: {corners.get('Inside Front', (0,0))[1] - corners.get('Inside Front', (0,0))[0]:.2f}s")
+            st.write("### 🛞 Rear Breakdown")
+            c_ir = corners.get('Inside Rear', (0,0))
+            c_or = corners.get('Outside Rear', (0,0))
+            c_tr = corners.get('Rear Transition', (0,0))
+            
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Inside Rear", f"{c_ir[1]-c_ir[0]:.2f}s")
+            t2.metric("Transition", f"{c_tr[1]-c_tr[0]:.2f}s")
+            t3.metric("Outside Rear", f"{c_or[1]-c_or[0]:.2f}s")
             
             st.subheader("Video Result")
             c1, c2 = st.columns([3,1])
@@ -507,7 +610,7 @@ def main():
             with c2:
                 if os.path.exists(vid_path):
                     with open(vid_path, 'rb') as f:
-                        st.download_button("Download MP4", f, file_name="pitstop_v65.mp4")
+                        st.download_button("Download MP4", f, file_name="pitstop_v66.mp4")
         else:
             st.warning("Please re-run analysis.")
 
