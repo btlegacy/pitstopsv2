@@ -10,8 +10,12 @@ from scipy.signal import savgol_filter, find_peaks
 # --- Configuration ---
 st.set_page_config(page_title="Pit Stop Analytics - Simple", layout="wide")
 
-# --- PASS 1: Global Extraction ---
+# --- PASS 1: Global Extraction (Optical Flow) ---
 def extract_telemetry(video_path, progress_callback):
+    """
+    Extracts Global Horizontal Flow (for Pit Stop) and Global Zoom (for Tires).
+    No YOLO/Object Detection required.
+    """
     cap = cv2.VideoCapture(video_path)
     
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -22,7 +26,7 @@ def extract_telemetry(video_path, progress_callback):
     
     telemetry_data = []
     
-    # Focus on Center 60% of screen (ignore pit wall/lane edges)
+    # Focus on Center 60% of screen to ignore pit lane traffic
     g_x1, g_x2 = int(width * 0.20), int(width * 0.80)
     g_y1, g_y2 = int(height * 0.20), int(height * 0.80)
     mid_x = int((g_x2 - g_x1) / 2)
@@ -47,21 +51,19 @@ def extract_telemetry(video_path, progress_callback):
         fx = flow[..., 0]
         fy = flow[..., 1]
         
-        # 1. Horizontal Momentum (For Pit Stop)
+        # 1. Horizontal Momentum (For Pit Stop Start/End)
         mag = np.sqrt(fx**2 + fy**2)
         active = mag > 1.0 
         flow_x = np.median(fx[active]) if np.any(active) else 0.0
         
-        # 2. Radial Zoom (For Tires)
-        # Split ROI Left/Right
+        # 2. Radial Zoom (For Tires Up/Down)
+        # Left side moves Left (-), Right side moves Right (+) = Expansion (Positive Zoom)
         f_left = fx[:, :mid_x]
         f_right = fx[:, mid_x:]
         
-        # Calculate expansion
         val_l = np.median(f_left[np.abs(f_left)>0.5]) if np.any(np.abs(f_left)>0.5) else 0.0
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         
-        # Right moves Right (+) minus Left moves Left (-) = Positive Expansion
         zoom_score = val_r - val_l
         
         telemetry_data.append({
@@ -74,7 +76,7 @@ def extract_telemetry(video_path, progress_callback):
         prev_roi = curr_roi
         frame_idx += 1
         
-        if frame_idx % 100 == 0: 
+        if frame_idx % 50 == 0: 
             progress_callback(frame_idx / total_frames)
 
     cap.release()
@@ -82,78 +84,77 @@ def extract_telemetry(video_path, progress_callback):
 
 # --- PASS 2: Logic Analysis ---
 def analyze_simple_states(df, fps):
+    if df.empty: return (None, None), (None, None)
+
     # Smoothing
     window = 15
     if len(df) > window:
         df['X_Sm'] = savgol_filter(df['Flow_X'], window, 3)
-        df['Zoom_Sm'] = savgol_filter(df['Zoom_Score'], 5, 3) # Faster response for zoom
+        df['Zoom_Sm'] = savgol_filter(df['Zoom_Score'], 5, 3) # Fast response for zoom
     else:
         df['X_Sm'] = df['Flow_X']
         df['Zoom_Sm'] = df['Zoom_Score']
 
-    # Calculate Zoom Velocity (Derivative) for the "Snap"
+    # Zoom Velocity (Derivative for Snap detection)
     df['Zoom_Vel'] = np.gradient(df['Zoom_Sm'])
 
-    # 1. PIT STOP (Arrival/Departure Peaks)
+    # 1. PIT STOP (Horizontal Stop)
     x_mag = df['X_Sm'].abs()
+    # Find huge spikes for arrival/departure
     peaks, _ = find_peaks(x_mag, height=x_mag.max()*0.3, distance=fps*5)
     
     t_start, t_end = None, None
     
     if len(peaks) >= 2:
-        # First Peak = Arrival, Last Peak = Departure
         arrival_idx = peaks[0]
         depart_idx = peaks[-1]
         
-        # Find Quiet Zone
+        # Stop threshold: 5% of max speed
         STOP_THRESH = x_mag.max() * 0.05
         
-        # Scan Forward from Arrival
         for i in range(arrival_idx, depart_idx):
             if x_mag.iloc[i] < STOP_THRESH:
                 t_start = df.iloc[i]['Time']
                 break
         
-        # Scan Backward from Departure
         for i in range(depart_idx, arrival_idx, -1):
             if x_mag.iloc[i] < STOP_THRESH:
                 t_end = df.iloc[i]['Time']
                 break
 
-    # 2. TIRES (Jacks Up/Down)
+    # 2. TIRES (Jacks Snap Logic)
     t_up, t_down = None, None
     
     if t_start and t_end:
-        # Look inside the stop window
-        # Stop looking 1s before car leaves to avoid departure noise
-        stop_win = df[(df['Time'] >= t_start) & (df['Time'] <= t_end - 1.0)]
+        # Search Window: Stop Start -> 1.0s before Stop End
+        # (Avoid confusing departure with jacks down)
+        t_limit = t_end - 1.0
+        stop_win = df[(df['Time'] >= t_start) & (df['Time'] <= t_limit)]
         
         if not stop_win.empty:
             z_pos = stop_win['Zoom_Sm'].values
-            z_vel = stop_window_vel = stop_win['Zoom_Vel'].values
+            z_vel = stop_win['Zoom_Vel'].values
             times = stop_win['Time'].values
             
-            # A. FIND LIFT (Expansion)
-            # Look for positive peaks in position
+            # A. FIND LIFT (First Expansion)
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0:
                 t_up = times[peaks_up[0]]
             else:
                 t_up = t_start # Fallback
                 
-            # B. FIND DROP (The "Snap")
-            # Look for the sharpest negative velocity AFTER the lift
-            mask_drop = times > t_up + 2.0 # Minimum 2s tire change
+            # B. FIND DROP (Sharpest Contraction)
+            # Look for Minimum Velocity (Negative Spike) AFTER Lift
+            mask_drop = times > t_up + 2.0 # Min 2s tire change
             
             if np.any(mask_drop):
                 drop_vels = z_vel[mask_drop]
                 drop_times = times[mask_drop]
                 
-                # The drop is the Minimum Velocity (Fastest Contraction)
                 min_idx = np.argmin(drop_vels)
                 min_val = drop_vels[min_idx]
                 
-                # Threshold to confirm it's a drop and not just drift
+                # Threshold for "Snap"
                 if min_val < -0.02:
                     t_down = drop_times[min_idx]
                 else:
@@ -184,8 +185,7 @@ def render_simple_overlay(input_path, pit_times, tire_times, fps, width, height,
         if not ret: break
         curr = frame_idx / fps
         
-        # --- TIMERS ---
-        # 1. Pit Stop
+        # 1. Pit Timer
         if t_start and curr >= t_start:
             if t_end and curr >= t_end:
                 val_pit = t_end - t_start
@@ -196,7 +196,7 @@ def render_simple_overlay(input_path, pit_times, tire_times, fps, width, height,
         else:
             val_pit, col_pit = 0.0, (200, 200, 200)
 
-        # 2. Tires
+        # 2. Tire Timer
         if t_up and curr >= t_up:
             if t_down and curr >= t_down:
                 val_tire = t_down - t_up
@@ -207,22 +207,19 @@ def render_simple_overlay(input_path, pit_times, tire_times, fps, width, height,
         else:
             val_tire, col_tire = 0.0, (200, 200, 200)
         
-        # --- DRAW ---
-        # Simple Top-Right Box
+        # Draw
         box_w, box_h = 350, 120
         cv2.rectangle(frame, (width - box_w, 0), (width, box_h), (0, 0, 0), -1)
         
-        # Pit Text
         cv2.putText(frame, "PIT STOP", (width - 330, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"{val_pit:.2f}s", (width - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, col_pit, 3)
 
-        # Tire Text
         cv2.putText(frame, "TIRES", (width - 330, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"{val_tire:.2f}s", (width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, col_tire, 3)
 
         out.write(frame)
         frame_idx += 1
-        if frame_idx % 100 == 0: progress_callback(frame_idx / total_frames)
+        if frame_idx % 50 == 0: progress_callback(frame_idx / total_frames)
             
     cap.release()
     out.release()
@@ -232,6 +229,7 @@ def render_simple_overlay(input_path, pit_times, tire_times, fps, width, height,
 def main():
     st.title("🏁 Pit Stop Analyzer V76")
     st.markdown("### Simplified Metrics")
+    st.info("Tracks Total Pit Stop Time & Total Tire Change Time using Global Optical Flow.")
     
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
@@ -284,7 +282,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_simplified.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_debug.mp4")
 
 if __name__ == "__main__":
     main()
