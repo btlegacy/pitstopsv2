@@ -30,7 +30,7 @@ def load_templates(folder_name):
             if img is not None: templates.append(img)
     return templates
 
-# --- PASS 1: Extraction (Restored V75 Logic) ---
+# --- PASS 1: Extraction ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -45,7 +45,7 @@ def extract_telemetry(video_path, progress_callback):
     
     telemetry_data = []
     
-    # V75 ROI (15% to 85%) - Restored for consistency
+    # ROI: Center 60%
     g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
     g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
     mid_x = int((g_x2 - g_x1) / 2)
@@ -87,7 +87,7 @@ def extract_telemetry(video_path, progress_callback):
             
         zoom_score = val_r - val_l
         
-        # 3. Dynamic Zones (Car Tracking) - Kept for stability even if not displayed
+        # 3. Dynamic Zones (Car Tracking) - Kept for stability
         w_tl, w_tr, w_bl, w_br = 0.0, 0.0, 0.0, 0.0
         score_in = 0.0
         fuel_box = None
@@ -102,19 +102,17 @@ def extract_telemetry(video_path, progress_callback):
                     valid.append(i)
             
             if valid:
-                # Get largest car
                 best_idx = max(valid, key=lambda i: boxes[i][2]*boxes[i][3])
                 cx, cy, cw, ch = boxes[best_idx]
                 
-                # A. Wheel Zones
                 roi_w = int(cw * 0.20)
                 roi_h = int(ch * 0.30)
                 
                 zones = [
-                    (int(cx - cw/2 - roi_w/2), int(cy - ch/2 - roi_h/4)), # TL
-                    (int(cx + cw/2 - roi_w/2), int(cy - ch/2 - roi_h/4)), # TR
-                    (int(cx - cw/2 - roi_w/2), int(cy + ch/2 - roi_h*0.75)), # BL
-                    (int(cx + cw/2 - roi_w/2), int(cy + ch/2 - roi_h*0.75)) # BR
+                    (int(cx - cw/2 - roi_w/2), int(cy - ch/2 - roi_h/4)), 
+                    (int(cx + cw/2 - roi_w/2), int(cy - ch/2 - roi_h/4)), 
+                    (int(cx - cw/2 - roi_w/2), int(cy + ch/2 - roi_h*0.75)), 
+                    (int(cx + cw/2 - roi_w/2), int(cy + ch/2 - roi_h*0.75)) 
                 ]
                 
                 acts = []
@@ -128,7 +126,7 @@ def extract_telemetry(video_path, progress_callback):
                 
                 w_tl, w_tr, w_bl, w_br = acts
                 
-                # B. Fuel Zone (Center Bottom)
+                # Fuel
                 fw = int(cw * 0.3)
                 fh = int(ch * 0.5)
                 fx = int(cx - fw/2)
@@ -164,7 +162,7 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis (Restored V75 Logic) ---
+# --- PASS 2: Analysis ---
 def analyze_states(df, fps):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'Probe_Match', 'Wheel_TL', 'Wheel_TR', 'Wheel_BL', 'Wheel_BR']
@@ -206,14 +204,12 @@ def analyze_states(df, fps):
             z_vel = stop_window['Zoom_Vel'].values
             times = stop_window['Time'].values
             
-            # V75 Logic: Peak Height 0.2
             peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
             if len(peaks_up) > 0: 
                 t_up = times[peaks_up[0]]
             else: 
                 t_up = t_start
                 
-            # V75 Logic: Min Vel < -0.02
             mask_drop = times > t_up + 2.0 
             if np.any(mask_drop):
                 drop_vel = z_vel[mask_drop]
@@ -226,15 +222,12 @@ def analyze_states(df, fps):
             else: 
                 t_down = t_end
 
-    # Note: We calculate Fuel/Corners but don't return them for display
-    # to keep the UI simple as requested.
-
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
     return (t_start, t_end), (t_up, t_down)
 
-# --- PASS 3: Render (Simplified) ---
+# --- PASS 3: Render (Updated Position) ---
 def render_simple_overlay(input_path, pit_times, tire_times, fps, width, height, progress_callback):
     cap = cv2.VideoCapture(input_path)
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -252,26 +245,43 @@ def render_simple_overlay(input_path, pit_times, tire_times, fps, width, height,
         if not ret: break
         curr = frame_idx / fps
         
-        # Timers
+        # 1. Pit Timer
         if t_start and curr >= t_start:
-            vp = (t_end - t_start) if (t_end and curr >= t_end) else (curr - t_start)
-            cp = (0,0,255) if (t_end and curr >= t_end) else (0,255,0)
-        else: vp, cp = 0.0, (200,200,200)
+            if t_end and curr >= t_end:
+                val_pit = t_end - t_start
+                col_pit = (0, 0, 255) # Red (Done)
+            else:
+                val_pit = curr - t_start
+                col_pit = (0, 255, 0) # Green (Running)
+        else:
+            val_pit, col_pit = 0.0, (200, 200, 200)
 
+        # 2. Tire Timer
         if t_up and curr >= t_up:
-            vt = (t_down - t_up) if (t_down and curr >= t_down) else (curr - t_up)
-            ct = (0,0,255) if (t_down and curr >= t_down) else (0,255,255)
-        else: vt, ct = 0.0, (200,200,200)
+            if t_down and curr >= t_down:
+                val_tire = t_down - t_up
+                col_tire = (0, 0, 255)
+            else:
+                val_tire = curr - t_up
+                col_tire = (0, 255, 255) # Cyan (Running)
+        else:
+            val_tire, col_tire = 0.0, (200, 200, 200)
         
-        # UI - Simplified to Top Right Box
+        # --- DRAW: Center Left ---
         box_w, box_h = 350, 120
-        cv2.rectangle(frame, (width - box_w, 0), (width, box_h), (0, 0, 0), -1)
+        box_x = 50 # Left margin
+        box_y = (height // 2) - (box_h // 2) # Vertically centered
         
-        cv2.putText(frame, "PIT STOP", (width - 330, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"{vp:.2f}s", (width - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, cp, 3)
+        # Background
+        cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
+        
+        # Pit Text
+        cv2.putText(frame, "PIT STOP", (box_x + 20, box_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"{val_pit:.2f}s", (box_x + 200, box_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, col_pit, 3)
 
-        cv2.putText(frame, "TIRES", (width - 330, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"{vt:.2f}s", (width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, ct, 3)
+        # Tire Text
+        cv2.putText(frame, "TIRES", (box_x + 20, box_y + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"{val_tire:.2f}s", (box_x + 200, box_y + 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, col_tire, 3)
 
         out.write(frame)
         frame_idx += 1
@@ -283,15 +293,9 @@ def render_simple_overlay(input_path, pit_times, tire_times, fps, width, height,
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V77")
-    st.markdown("### Simplified Metrics")
-    st.info("Shows only Total Pit Stop Time and Total Tire Change Time using robust V75 logic.")
-
-    missing = []
-    for r in ["probein", "probeout", "emptyfuelport"]:
-        p = os.path.join(BASE_DIR, "refs", r)
-        if not os.path.exists(p) and not glob.glob(p+".*"): missing.append(r)
-    if missing: st.error(f"Missing refs: {missing}")
+    st.title("🏁 Pit Stop Analyzer V78")
+    st.markdown("### Simplified Metrics (Center Left UI)")
+    st.info("Shows Total Pit Stop & Total Tire Change Time. Positioned at center-left.")
     
     if 'analysis_done' not in st.session_state:
         st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
